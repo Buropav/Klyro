@@ -36,6 +36,7 @@ const CLOUD_MAP_NAMESPACE = 'klyro.internal';
 export class ComputeStack extends cdk.Stack {
   public readonly cluster: ecs.Cluster;
   public readonly appService: ecs.FargateService;
+  public readonly appTaskDefinition: ecs.FargateTaskDefinition;
   public readonly dbService: ecs.FargateService;
   public readonly dbInitTaskDefinition: ecs.FargateTaskDefinition;
   public readonly k6TaskDefinition: ecs.FargateTaskDefinition;
@@ -177,13 +178,13 @@ export class ComputeStack extends cdk.Stack {
     // optimized runs; only the image tag changes, and that happens via
     // out-of-band ECS RegisterTaskDefinition/UpdateService calls from the
     // orchestration pipeline, not by redeploying this stack.
-    const appTaskDefinition = new ecs.FargateTaskDefinition(this, 'AppTaskDefinition', {
+    this.appTaskDefinition = new ecs.FargateTaskDefinition(this, 'AppTaskDefinition', {
       family: 'klyro-app',
       cpu: 512,
       memoryLimitMiB: 1024,
     });
 
-    appTaskDefinition.addContainer('app', {
+    this.appTaskDefinition.addContainer('app', {
       containerName: 'app',
       image: ecs.ContainerImage.fromEcrRepository(appRepository, appImageTag),
       portMappings: [{ containerPort: APP_PORT }],
@@ -203,7 +204,7 @@ export class ComputeStack extends cdk.Stack {
     this.appService = new ecs.FargateService(this, 'AppService', {
       serviceName: 'klyro-app',
       cluster: this.cluster,
-      taskDefinition: appTaskDefinition,
+      taskDefinition: this.appTaskDefinition,
       desiredCount: 1,
       assignPublicIp: true,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },

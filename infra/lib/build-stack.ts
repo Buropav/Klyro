@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as codebuild from 'aws-cdk-lib/aws-codebuild';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 
@@ -9,11 +10,13 @@ export interface BuildStackProps extends cdk.StackProps {
   runsBucket: s3.IBucket;
 }
 
-// Placeholder source key the project is defined against at synth time. Each
-// real build overrides this via StartBuild's sourceLocationOverride, pointing
-// at that run's zipped repo snapshot (demo-app/, possibly LLM-patched)
-// uploaded to s3://<runsBucket>/runs/<runId>/source.zip.
-const PLACEHOLDER_SOURCE_KEY = 'source/bootstrap-placeholder.zip';
+// The one, permanent CodeBuild source: a zip of demo-app/ (repo-root
+// relative, so it unpacks to a "demo-app/" folder in the build
+// workspace), uploaded once out-of-band (see infra/README or the deploy
+// notes) — not per-run. Both baseline and optimized builds use this same
+// zip; "optimized" builds patch one file in place during pre_build
+// instead of needing a second, per-run source archive.
+const BASELINE_SOURCE_KEY = 'source/baseline.zip';
 
 export class BuildStack extends cdk.Stack {
   public readonly appBuildProject: codebuild.Project;
@@ -28,7 +31,7 @@ export class BuildStack extends cdk.Stack {
       env: {
         variables: {
           // Overridden per-invocation by the orchestration Step Functions
-          // (environmentVariablesOverride on StartBuild) with the real
+          // (EnvironmentVariablesOverride on StartBuild) with the real
           // runId and phase (baseline|optimized). These defaults only
           // matter for a manual/ad-hoc build.
           RUN_ID: 'local',
@@ -45,6 +48,15 @@ export class BuildStack extends cdk.Stack {
             // artifact in this pipeline is keyed by runId instead.
             'IMAGE_TAG="${RUN_ID}-${PHASE}"',
             'echo "Resolved image tag: $IMAGE_TAG (source version was $CODEBUILD_RESOLVED_SOURCE_VERSION)"',
+            // For an "optimized" build, the source tree is still the
+            // unmodified baseline — apply the guard-verified patch from
+            // the baseline phase in place before building, rather than
+            // needing a second, per-run source zip.
+            'if [ "$PHASE" = "optimized" ]; then\n' +
+              '  echo "Applying guarded patch for $RUN_ID...";\n' +
+              '  aws s3 cp "s3://${RESULTS_BUCKET}/runs/${RUN_ID}/baseline/patch.verified.json" /tmp/patch.json;\n' +
+              '  node -e "const fs=require(\'fs\');const p=JSON.parse(fs.readFileSync(\'/tmp/patch.json\',\'utf8\'));fs.writeFileSync(p.file,p.full_new_content,\'utf8\');console.log(\'Patched\',p.file);"\n' +
+              'fi',
           ],
         },
         build: {
@@ -67,7 +79,7 @@ export class BuildStack extends cdk.Stack {
       description: 'Builds demo-app/Dockerfile and pushes runId-phase tagged images to ECR',
       source: codebuild.Source.s3({
         bucket: runsBucket,
-        path: PLACEHOLDER_SOURCE_KEY,
+        path: BASELINE_SOURCE_KEY,
       }),
       environment: {
         buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
@@ -76,6 +88,7 @@ export class BuildStack extends cdk.Stack {
       },
       environmentVariables: {
         ECR_REPOSITORY_URI: { value: appRepository.repositoryUri },
+        RESULTS_BUCKET: { value: runsBucket.bucketName },
         RUN_ID: { value: 'local' },
         PHASE: { value: 'baseline' },
       },
@@ -97,13 +110,15 @@ export class BuildStack extends cdk.Stack {
     // resource-level scoping).
     appRepository.grantPullPush(this.appBuildProject);
 
-    // codebuild.Source.s3() above already grants read on the placeholder
-    // key alone. Real runs override the source per-build (StartBuild's
-    // sourceLocationOverride) with a runId-specific zip under the same
-    // "source/" prefix, so the build role needs read on the whole prefix,
-    // not just the one placeholder object — mirrors the runs/<runId>/*
-    // scoping CLAUDE.md specifies for the k6 task role.
-    runsBucket.grantRead(this.appBuildProject, 'source/*');
+    // codebuild.Source.s3() above already grants read on exactly
+    // BASELINE_SOURCE_KEY. "optimized" builds additionally need to read
+    // the guarded patch produced by the baseline phase's guard/ Lambda.
+    this.appBuildProject.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject'],
+        resources: [runsBucket.arnForObjects('runs/*/baseline/patch.verified.json')],
+      })
+    );
 
     new cdk.CfnOutput(this, 'AppBuildProjectName', { value: this.appBuildProject.projectName });
   }
