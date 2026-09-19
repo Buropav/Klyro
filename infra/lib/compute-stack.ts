@@ -4,7 +4,9 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 import { Construct } from 'constructs';
@@ -12,6 +14,8 @@ import { Construct } from 'constructs';
 export interface ComputeStackProps extends cdk.StackProps {
   vpc: ec2.IVpc;
   appRepository: ecr.IRepository;
+  k6Repository: ecr.IRepository;
+  runsBucket: s3.IBucket;
   /**
    * Image tag the "app" service's task definition is seeded with at
    * `cdk deploy` time. Runtime baseline/optimized runs register their own
@@ -19,6 +23,8 @@ export interface ComputeStackProps extends cdk.StackProps {
    * via the ECS API from the orchestration pipeline, not through CDK.
    */
   appImageTag?: string;
+  /** Image tag for the k6 task definition. This image doesn't change per-run. */
+  k6ImageTag?: string;
 }
 
 const DB_NAME = 'klyro';
@@ -32,15 +38,18 @@ export class ComputeStack extends cdk.Stack {
   public readonly appService: ecs.FargateService;
   public readonly dbService: ecs.FargateService;
   public readonly dbInitTaskDefinition: ecs.FargateTaskDefinition;
+  public readonly k6TaskDefinition: ecs.FargateTaskDefinition;
   public readonly appSecurityGroup: ec2.SecurityGroup;
   public readonly dbSecurityGroup: ec2.SecurityGroup;
   public readonly dbInitSecurityGroup: ec2.SecurityGroup;
+  public readonly k6SecurityGroup: ec2.SecurityGroup;
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
 
-    const { vpc, appRepository } = props;
+    const { vpc, appRepository, k6Repository, runsBucket } = props;
     const appImageTag = props.appImageTag ?? 'bootstrap';
+    const k6ImageTag = props.k6ImageTag ?? 'latest';
 
     this.cluster = new ecs.Cluster(this, 'KlyroCluster', {
       clusterName: 'klyro-cluster',
@@ -96,6 +105,18 @@ export class ComputeStack extends cdk.Stack {
       this.dbInitSecurityGroup,
       ec2.Port.tcp(DB_PORT),
       'Allow the db-init task to reach Postgres'
+    );
+
+    this.k6SecurityGroup = new ec2.SecurityGroup(this, 'K6SecurityGroup', {
+      securityGroupName: 'klyro-k6-sg',
+      vpc,
+      description: 'Klyro k6 load-test task',
+      allowAllOutbound: true,
+    });
+    this.appSecurityGroup.addIngressRule(
+      this.k6SecurityGroup,
+      ec2.Port.tcp(APP_PORT),
+      'Allow the k6 task to reach the app service'
     );
 
     // --- db: long-lived Fargate service ---------------------------------
@@ -239,8 +260,51 @@ export class ComputeStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({ logGroup: dbInitLogGroup, streamPrefix: 'db-init' }),
     });
 
+    // --- k6: one-off task definition that load-tests app and uploads
+    // results.json to S3 -------------------------------------------------
+    const k6LogGroup = new logs.LogGroup(this, 'K6LogGroup', {
+      logGroupName: '/klyro/ecs/k6',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    this.k6TaskDefinition = new ecs.FargateTaskDefinition(this, 'K6TaskDefinition', {
+      family: 'klyro-k6',
+      cpu: 512,
+      memoryLimitMiB: 1024,
+    });
+
+    this.k6TaskDefinition.addContainer('k6', {
+      containerName: 'k6',
+      image: ecs.ContainerImage.fromEcrRepository(k6Repository, k6ImageTag),
+      essential: true,
+      environment: {
+        // Fixed, known at synth time.
+        S3_BUCKET: runsBucket.bucketName,
+        // RUN_ID, PHASE, and TARGET_URL are deliberately absent here —
+        // run-and-upload.sh requires them and fails fast if they're
+        // missing, so every invocation must supply them via RunTask
+        // containerOverrides. Baking in defaults would let a caller
+        // silently reuse a stale runId/phase/target.
+      },
+      logging: ecs.LogDrivers.awsLogs({ logGroup: k6LogGroup, streamPrefix: 'k6' }),
+    });
+
+    // Exactly s3:PutObject on runs/<anything>/<anything>/results.json —
+    // not grantPut(), which also adds PutObjectLegalHold/Retention/Tagging
+    // and Abort* and would be broader than what this task actually needs.
+    this.k6TaskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:PutObject'],
+        resources: [runsBucket.arnForObjects('runs/*/*/results.json')],
+      })
+    );
+
     new cdk.CfnOutput(this, 'DbInitTaskDefinitionArn', {
       value: this.dbInitTaskDefinition.taskDefinitionArn,
+    });
+    new cdk.CfnOutput(this, 'K6TaskDefinitionArn', {
+      value: this.k6TaskDefinition.taskDefinitionArn,
     });
     new cdk.CfnOutput(this, 'ClusterName', { value: this.cluster.clusterName });
   }

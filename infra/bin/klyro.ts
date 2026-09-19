@@ -19,7 +19,10 @@ const compute = new ComputeStack(app, 'Klyro-ComputeStack', {
   env,
   vpc: network.vpc,
   appRepository: data.appRepository,
+  k6Repository: data.k6Repository,
+  runsBucket: data.runsBucket,
   appImageTag: app.node.tryGetContext('appImageTag') ?? 'bootstrap',
+  k6ImageTag: app.node.tryGetContext('k6ImageTag') ?? 'latest',
 });
 compute.addStackDependency(network);
 compute.addStackDependency(data);
