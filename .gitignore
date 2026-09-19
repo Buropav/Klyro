@@ -9,6 +9,9 @@ dist/
 cdk.out/
 .cdk.staging/
 
+# Generated at CDK synth time from demo-app/ source — see orchestration-stack.ts
+lambdas/*.generated.json
+
 # OS
 .DS_Store
 Thumbs.db
