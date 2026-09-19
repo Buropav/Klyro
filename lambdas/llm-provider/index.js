@@ -108,7 +108,14 @@ class MistralProvider {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`Mistral API error ${res.status}: ${text.slice(0, 500)}`);
+      const err = new Error(`Mistral API error ${res.status}: ${text.slice(0, 500)}`);
+      if (res.status === 429) {
+        // An immediate retry after a 429 has ~zero chance of succeeding.
+        // Honor Retry-After if given, else back off a fixed amount.
+        const retryAfterHeader = Number(res.headers.get('retry-after'));
+        err.retryAfterMs = (Number.isFinite(retryAfterHeader) ? retryAfterHeader : 3) * 1000;
+      }
+      throw err;
     }
 
     const body = await res.json();
@@ -135,9 +142,16 @@ class MistralProvider {
       } catch (err) {
         lastError = err;
         if (attempt === 2) break;
-        prompt =
-          `${userPrompt}\n\n---\nYour previous response was invalid: ${err.message}\n` +
-          'Respond again with ONLY a single JSON object matching the required schema exactly — no prose, no markdown fences.';
+        if (err.retryAfterMs) {
+          // Rate-limited: back off, then retry the exact same prompt —
+          // appending "your response was invalid" would be actively
+          // wrong here, since the model never actually responded.
+          await new Promise((resolve) => setTimeout(resolve, Math.min(err.retryAfterMs, 10000)));
+        } else {
+          prompt =
+            `${userPrompt}\n\n---\nYour previous response was invalid: ${err.message}\n` +
+            'Respond again with ONLY a single JSON object matching the required schema exactly — no prose, no markdown fences.';
+        }
       }
     }
     throw new AI_FAILED(`LLM completion failed after retry: ${lastError?.message}`, lastError);
