@@ -248,6 +248,23 @@ export class OrchestrationStack extends cdk.Stack {
     grantGet(this.reportWriterFunction, 'runs/*/*/summary.json');
     grantGet(this.reportWriterFunction, 'runs/*/evaluation.json');
     grantPutJson(this.reportWriterFunction, 'runs/*/report.json');
+    // report-writer's readJsonOptional() reads several of the above keys
+    // that legitimately may not exist yet (this is the whole point of the
+    // MarkFailed path — most of a run's artifacts are still missing when
+    // it fails early). Without s3:ListBucket, S3 returns 403 AccessDenied
+    // (mentioning ListBucket) instead of 404 NoSuchKey for a GetObject on
+    // a missing key when the caller lacks list permission on the bucket,
+    // which readJsonOptional's `err.name === 'NoSuchKey'` check doesn't
+    // catch — so a normal "file doesn't exist yet" case was throwing and
+    // taking down the MarkFailed safety net itself. Scoped to the runs/
+    // prefix this function already reads/writes, not the whole bucket.
+    this.reportWriterFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [runsBucket.bucketArn],
+        conditions: { StringLike: { 's3:prefix': 'runs/*' } },
+      })
+    );
 
     // --- experiment state machine -------------------------------------
     const stateMachineRole = new iam.Role(this, 'ExperimentStateMachineRole', {
