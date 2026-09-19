@@ -20,9 +20,14 @@ export interface OrchestrationStackProps extends cdk.StackProps {
   stateMachineArn?: string;
 }
 
-const GROQ_API_KEY_PARAM = '/klyro/groq-api-key';
-const GROQ_MODEL_ANALYST_DEFAULT = 'openai/gpt-oss-20b';
-const GROQ_MODEL_INVESTIGATOR_DEFAULT = 'openai/gpt-oss-120b';
+// Mistral, not Groq — CLAUDE.md originally specified Groq, but the user
+// already had a Mistral key in hand and Mistral's free-tier rate limits
+// suit this project's repeated-testing usage better; Mistral's API is
+// OpenAI-compatible so MistralProvider only differs from a Groq client in
+// base URL and model IDs (see lambdas/llm-provider/index.js).
+const MISTRAL_API_KEY_PARAM = '/klyro/mistral-api-key';
+const LLM_MODEL_ANALYST_DEFAULT = 'mistral-small-latest';
+const LLM_MODEL_INVESTIGATOR_DEFAULT = 'mistral-large-latest';
 
 // Must match CLAUDE.md's Investigator allowlist exactly.
 const ALLOWLISTED_FILES = ['demo-app/src/orders.js', 'demo-app/src/logger.js', 'demo-app/config/logger.json'];
@@ -90,9 +95,10 @@ export class OrchestrationStack extends cdk.Stack {
         environment: { ...commonEnv, ...extraEnv },
         logGroup,
         // No vpc/vpcSubnets on any of these — they only talk to S3,
-        // CloudWatch, SSM, Step Functions, and Groq's public API, none of
-        // which needs VPC access. Staying out of the VPC avoids a NAT
-        // gateway, same reasoning CLAUDE.md gives for the Groq calls.
+        // CloudWatch, SSM, Step Functions, and Mistral's public API, none
+        // of which needs VPC access. Staying out of the VPC avoids a NAT
+        // gateway, same reasoning CLAUDE.md originally gave for the Groq
+        // calls (now Mistral) it specified.
       });
     };
 
@@ -109,11 +115,11 @@ export class OrchestrationStack extends cdk.Stack {
         new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: [runsBucket.arnForObjects(keyPattern)] })
       );
 
-    const groqParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${GROQ_API_KEY_PARAM}`;
+    const mistralParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${MISTRAL_API_KEY_PARAM}`;
     const ssmDefaultKmsKeyArn = `arn:aws:kms:${this.region}:${this.account}:alias/aws/ssm`;
-    const grantGroqAccess = (fn: lambda.Function) => {
+    const grantMistralAccess = (fn: lambda.Function) => {
       fn.addToRolePolicy(
-        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [groqParamArn] })
+        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [mistralParamArn] })
       );
       fn.addToRolePolicy(
         new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [ssmDefaultKmsKeyArn] })
@@ -139,29 +145,29 @@ export class OrchestrationStack extends cdk.Stack {
       'AnalystFunction',
       'analyst',
       {
-        GROQ_API_KEY_PARAM,
-        GROQ_MODEL_ANALYST: process.env.GROQ_MODEL_ANALYST || GROQ_MODEL_ANALYST_DEFAULT,
+        MISTRAL_API_KEY_PARAM,
+        LLM_MODEL_ANALYST: process.env.LLM_MODEL_ANALYST || LLM_MODEL_ANALYST_DEFAULT,
       },
       { timeoutSeconds: 90 }
     );
     grantGet(this.analystFunction, 'runs/*/*/summary.json');
     grantPutJson(this.analystFunction, 'runs/*/*/finding.json');
-    grantGroqAccess(this.analystFunction);
+    grantMistralAccess(this.analystFunction);
 
     // --- investigator ---------------------------------------------------
     this.investigatorFunction = makeFunction(
       'InvestigatorFunction',
       'investigator',
       {
-        GROQ_API_KEY_PARAM,
-        GROQ_MODEL_INVESTIGATOR: process.env.GROQ_MODEL_INVESTIGATOR || GROQ_MODEL_INVESTIGATOR_DEFAULT,
+        MISTRAL_API_KEY_PARAM,
+        LLM_MODEL_INVESTIGATOR: process.env.LLM_MODEL_INVESTIGATOR || LLM_MODEL_INVESTIGATOR_DEFAULT,
       },
       { timeoutSeconds: 90 }
     );
     grantGet(this.investigatorFunction, 'runs/*/*/finding.json');
     grantGet(this.investigatorFunction, 'runs/*/*/summary.json');
     grantPutJson(this.investigatorFunction, 'runs/*/*/patch.json');
-    grantGroqAccess(this.investigatorFunction);
+    grantMistralAccess(this.investigatorFunction);
 
     // --- guard ------------------------------------------------------------
     this.guardFunction = makeFunction('GuardFunction', 'guard', {}, { memoryMB: 128, timeoutSeconds: 30 });

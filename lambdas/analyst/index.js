@@ -2,14 +2,14 @@
 
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
-const { GroqProvider } = require('../llm-provider');
+const { MistralProvider } = require('../llm-provider');
 
 const s3 = new S3Client({});
 const ssm = new SSMClient({});
 
 const BUCKET = process.env.RESULTS_BUCKET;
-const GROQ_API_KEY_PARAM = process.env.GROQ_API_KEY_PARAM;
-const GROQ_MODEL_ANALYST = process.env.GROQ_MODEL_ANALYST;
+const MISTRAL_API_KEY_PARAM = process.env.MISTRAL_API_KEY_PARAM;
+const LLM_MODEL_ANALYST = process.env.LLM_MODEL_ANALYST;
 
 const FINDING_SCHEMA = {
   type: 'object',
@@ -36,9 +36,9 @@ markdown fences:
 {"metric": "<one of the metric names from the summary>", "reasoning": "<why this metric is anomalous>", "severity": "low" | "medium" | "high"}`;
 
 let cachedApiKey;
-async function getGroqApiKey() {
+async function getMistralApiKey() {
   if (cachedApiKey) return cachedApiKey;
-  const res = await ssm.send(new GetParameterCommand({ Name: GROQ_API_KEY_PARAM, WithDecryption: true }));
+  const res = await ssm.send(new GetParameterCommand({ Name: MISTRAL_API_KEY_PARAM, WithDecryption: true }));
   cachedApiKey = res.Parameter.Value;
   return cachedApiKey;
 }
@@ -58,8 +58,8 @@ exports.handler = async (event) => {
 
   const summary = await readJson(`runs/${runId}/${phase}/summary.json`);
 
-  const apiKey = await getGroqApiKey();
-  const provider = new GroqProvider({ apiKey, model: GROQ_MODEL_ANALYST });
+  const apiKey = await getMistralApiKey();
+  const provider = new MistralProvider({ apiKey, model: LLM_MODEL_ANALYST });
 
   const userPrompt = `Metrics summary for run ${runId} (${phase}):\n${JSON.stringify(summary, null, 2)}`;
 

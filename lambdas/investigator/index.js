@@ -3,7 +3,7 @@
 const crypto = require('node:crypto');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
-const { GroqProvider } = require('../llm-provider');
+const { MistralProvider } = require('../llm-provider');
 // Generated at CDK synth time (orchestration-stack.ts) from the actual
 // current content of the three allowlisted demo-app files. Shared with
 // guard/, which independently re-verifies against the same manifest.
@@ -13,8 +13,8 @@ const s3 = new S3Client({});
 const ssm = new SSMClient({});
 
 const BUCKET = process.env.RESULTS_BUCKET;
-const GROQ_API_KEY_PARAM = process.env.GROQ_API_KEY_PARAM;
-const GROQ_MODEL_INVESTIGATOR = process.env.GROQ_MODEL_INVESTIGATOR;
+const MISTRAL_API_KEY_PARAM = process.env.MISTRAL_API_KEY_PARAM;
+const LLM_MODEL_INVESTIGATOR = process.env.LLM_MODEL_INVESTIGATOR;
 
 const ALLOWLIST = Object.keys(allowlistManifest);
 
@@ -60,9 +60,9 @@ function sha256(content) {
 }
 
 let cachedApiKey;
-async function getGroqApiKey() {
+async function getMistralApiKey() {
   if (cachedApiKey) return cachedApiKey;
-  const res = await ssm.send(new GetParameterCommand({ Name: GROQ_API_KEY_PARAM, WithDecryption: true }));
+  const res = await ssm.send(new GetParameterCommand({ Name: MISTRAL_API_KEY_PARAM, WithDecryption: true }));
   cachedApiKey = res.Parameter.Value;
   return cachedApiKey;
 }
@@ -125,8 +125,8 @@ exports.handler = async (event) => {
     2
   );
 
-  const apiKey = await getGroqApiKey();
-  const provider = new GroqProvider({ apiKey, model: GROQ_MODEL_INVESTIGATOR });
+  const apiKey = await getMistralApiKey();
+  const provider = new MistralProvider({ apiKey, model: LLM_MODEL_INVESTIGATOR });
 
   const patch = await provider.complete(SYSTEM_PROMPT, userPrompt, PATCH_SCHEMA);
 
