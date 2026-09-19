@@ -6,7 +6,7 @@ const logger = require('./logger');
 const healthRoute = require('./routes/health');
 const authRoute = require('./routes/auth');
 const productsRoute = require('./routes/products');
-const ordersRoute = require('./routes/orders');
+const ordersRoute = require('./orders');
 
 const app = express();
 app.use(express.json());
