@@ -1,0 +1,356 @@
+{
+  "Comment": "Klyro experiment pipeline: build+seed, deploy, load-test, diagnose, patch, rebuild+redeploy, load-test, evaluate, report.",
+  "StartAt": "ParallelBaselineBuildAndSeed",
+  "States": {
+    "ParallelBaselineBuildAndSeed": {
+      "Type": "Parallel",
+      "ResultPath": null,
+      "Branches": [
+        {
+          "StartAt": "BuildBaselineImage",
+          "States": {
+            "BuildBaselineImage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${AppBuildProjectName}",
+                "EnvironmentVariablesOverride": [
+                  { "Name": "RUN_ID", "Value.$": "$.runId", "Type": "PLAINTEXT" },
+                  { "Name": "PHASE", "Value": "baseline", "Type": "PLAINTEXT" }
+                ]
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "SeedDatabaseBaseline",
+          "States": {
+            "SeedDatabaseBaseline": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "Cluster": "${ClusterName}",
+                "TaskDefinition": "${DbInitTaskFamily}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
+                    "SecurityGroups": ["${DbInitSecurityGroupId}"],
+                    "AssignPublicIp": "ENABLED"
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "DeployBaselineImage"
+    },
+
+    "DeployBaselineImage": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DeployAppFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "InitBaselinePollCount"
+    },
+
+    "InitBaselinePollCount": {
+      "Type": "Pass",
+      "Parameters": { "runId.$": "$.runId", "pollCount": 0 },
+      "Next": "DescribeAppServiceBaseline"
+    },
+    "DescribeAppServiceBaseline": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
+      "Parameters": { "Cluster": "${ClusterName}", "Services": ["${AppServiceName}"] },
+      "ResultPath": "$.describeResult",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "CheckBaselineRollout"
+    },
+    "CheckBaselineRollout": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.describeResult.Services[0].Deployments[0].RolloutState",
+          "StringEquals": "COMPLETED",
+          "Next": "RunK6Baseline"
+        },
+        { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "SetBaselineRolloutTimeoutError" }
+      ],
+      "Default": "WaitBaselineRollout"
+    },
+    "WaitBaselineRollout": { "Type": "Wait", "Seconds": 15, "Next": "IncrementBaselinePollCount" },
+    "IncrementBaselinePollCount": {
+      "Type": "Pass",
+      "Parameters": { "runId.$": "$.runId", "pollCount.$": "States.MathAdd($.pollCount, 1)" },
+      "Next": "DescribeAppServiceBaseline"
+    },
+    "SetBaselineRolloutTimeoutError": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "error": {
+          "Error": "RolloutTimeout",
+          "Cause": "App service rollout for phase=baseline did not reach RolloutState=COMPLETED within the polling budget"
+        }
+      },
+      "Next": "MarkFailed"
+    },
+
+    "RunK6Baseline": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ClusterName}",
+        "TaskDefinition": "${K6TaskFamily}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
+            "SecurityGroups": ["${K6SecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "k6",
+              "Environment": [
+                { "Name": "RUN_ID", "Value.$": "$.runId" },
+                { "Name": "PHASE", "Value": "baseline" },
+                { "Name": "TARGET_URL", "Value": "${AppTargetUrl}" }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "CompactBaselineMetrics"
+    },
+
+    "CompactBaselineMetrics": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${MetricsCompactorFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "RunAnalyst"
+    },
+    "RunAnalyst": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AnalystFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "RunInvestigator"
+    },
+    "RunInvestigator": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${InvestigatorFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "RunGuard"
+    },
+    "RunGuard": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${GuardFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "BuildOptimizedImage"
+    },
+
+    "BuildOptimizedImage": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${AppBuildProjectName}",
+        "EnvironmentVariablesOverride": [
+          { "Name": "RUN_ID", "Value.$": "$.runId", "Type": "PLAINTEXT" },
+          { "Name": "PHASE", "Value": "optimized", "Type": "PLAINTEXT" }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "DeployOptimizedImage"
+    },
+    "DeployOptimizedImage": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DeployAppFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "optimized" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "InitOptimizedPollCount"
+    },
+
+    "InitOptimizedPollCount": {
+      "Type": "Pass",
+      "Parameters": { "runId.$": "$.runId", "pollCount": 0 },
+      "Next": "DescribeAppServiceOptimized"
+    },
+    "DescribeAppServiceOptimized": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
+      "Parameters": { "Cluster": "${ClusterName}", "Services": ["${AppServiceName}"] },
+      "ResultPath": "$.describeResult",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "CheckOptimizedRollout"
+    },
+    "CheckOptimizedRollout": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.describeResult.Services[0].Deployments[0].RolloutState",
+          "StringEquals": "COMPLETED",
+          "Next": "SeedDatabaseOptimized"
+        },
+        { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "SetOptimizedRolloutTimeoutError" }
+      ],
+      "Default": "WaitOptimizedRollout"
+    },
+    "WaitOptimizedRollout": { "Type": "Wait", "Seconds": 15, "Next": "IncrementOptimizedPollCount" },
+    "IncrementOptimizedPollCount": {
+      "Type": "Pass",
+      "Parameters": { "runId.$": "$.runId", "pollCount.$": "States.MathAdd($.pollCount, 1)" },
+      "Next": "DescribeAppServiceOptimized"
+    },
+    "SetOptimizedRolloutTimeoutError": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "error": {
+          "Error": "RolloutTimeout",
+          "Cause": "App service rollout for phase=optimized did not reach RolloutState=COMPLETED within the polling budget"
+        }
+      },
+      "Next": "MarkFailed"
+    },
+
+    "SeedDatabaseOptimized": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ClusterName}",
+        "TaskDefinition": "${DbInitTaskFamily}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
+            "SecurityGroups": ["${DbInitSecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "RunK6Optimized"
+    },
+    "RunK6Optimized": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${ClusterName}",
+        "TaskDefinition": "${K6TaskFamily}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
+            "SecurityGroups": ["${K6SecurityGroupId}"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "k6",
+              "Environment": [
+                { "Name": "RUN_ID", "Value.$": "$.runId" },
+                { "Name": "PHASE", "Value": "optimized" },
+                { "Name": "TARGET_URL", "Value": "${AppTargetUrl}" }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "CompactOptimizedMetrics"
+    },
+
+    "CompactOptimizedMetrics": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${MetricsCompactorFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "phase": "optimized" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "RunEvaluator"
+    },
+    "RunEvaluator": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${EvaluatorFunctionArn}",
+        "Payload": { "runId.$": "$.runId" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "RunReportWriter"
+    },
+    "RunReportWriter": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ReportWriterFunctionArn}",
+        "Payload": { "runId.$": "$.runId" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "ExperimentSucceeded"
+    },
+    "ExperimentSucceeded": { "Type": "Succeed" },
+
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ReportWriterFunctionArn}",
+        "Payload": { "runId.$": "$.runId", "error.$": "$.error" }
+      },
+      "ResultPath": null,
+      "Next": "ExperimentFailed"
+    },
+    "ExperimentFailed": {
+      "Type": "Fail",
+      "Error": "ExperimentFailed",
+      "Cause": "Klyro experiment pipeline failed - see runs/<runId>/report.json for the recorded reason"
+    }
+  }
+}
