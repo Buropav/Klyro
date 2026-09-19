@@ -4,6 +4,7 @@ import { NetworkStack } from '../lib/network-stack';
 import { DataStack } from '../lib/data-stack';
 import { ComputeStack } from '../lib/compute-stack';
 import { BuildStack } from '../lib/build-stack';
+import { OrchestrationStack } from '../lib/orchestration-stack';
 
 const app = new cdk.App();
 
@@ -33,3 +34,13 @@ const build = new BuildStack(app, 'Klyro-BuildStack', {
   runsBucket: data.runsBucket,
 });
 build.addStackDependency(data);
+
+const orchestration = new OrchestrationStack(app, 'Klyro-OrchestrationStack', {
+  env,
+  runsBucket: data.runsBucket,
+  clusterName: compute.cluster.clusterName,
+  appServiceName: compute.appService.serviceName,
+  stateMachineArn: app.node.tryGetContext('stateMachineArn'),
+});
+orchestration.addStackDependency(data);
+orchestration.addStackDependency(compute);
