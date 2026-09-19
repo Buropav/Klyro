@@ -255,6 +255,22 @@ export class OrchestrationStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('states.amazonaws.com'),
     });
 
+    // Collected into an explicit iam.Policy (below) instead of using
+    // stateMachineRole.addToPolicy() directly: addToPolicy's statements
+    // land on a separate AWS::IAM::Policy resource that only the Role
+    // (not this policy) is wired into stateMachineRole.roleArn's CFN
+    // dependency graph, so CloudFormation has no ordering guarantee that
+    // the policy is attached before CreateStateMachine runs — which is
+    // exactly what caused the "not authorized to create managed-rule"
+    // AccessDenied on first deploy (CreateStateMachine validates managed
+    // EventBridge rule permissions synchronously, unlike Lambda's lazy
+    // invoke-time IAM checks). An explicit dependency on the Policy
+    // resource itself fixes the ordering.
+    const stateMachinePolicyStatements: iam.PolicyStatement[] = [];
+    const addStateMachinePolicy = (statement: iam.PolicyStatement) => {
+      stateMachinePolicyStatements.push(statement);
+    };
+
     for (const fn of [
       this.metricsCompactorFunction,
       this.analystFunction,
@@ -264,7 +280,7 @@ export class OrchestrationStack extends cdk.Stack {
       this.evaluatorFunction,
       this.reportWriterFunction,
     ]) {
-      stateMachineRole.addToPolicy(
+      addStateMachinePolicy(
         new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [fn.functionArn] })
       );
     }
@@ -272,13 +288,13 @@ export class OrchestrationStack extends cdk.Stack {
     // CodeBuild StartBuild.sync — the extra events:* grant is the documented
     // requirement for Step Functions' .sync integrations: they subscribe to
     // a managed EventBridge rule to know when the build finishes.
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({
         actions: ['codebuild:StartBuild', 'codebuild:StopBuild', 'codebuild:BatchGetBuilds'],
         resources: [appBuildProject.projectArn],
       })
     );
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({
         actions: ['events:PutTargets', 'events:PutRule', 'events:DescribeRule'],
         resources: [
@@ -292,7 +308,7 @@ export class OrchestrationStack extends cdk.Stack {
     // whichever task/execution roles those two task definitions use.
     const dbInitTaskDefArnPattern = `arn:aws:ecs:${this.region}:${this.account}:task-definition/${dbInitTaskDefinition.family}:*`;
     const k6TaskDefArnPattern = `arn:aws:ecs:${this.region}:${this.account}:task-definition/${k6TaskDefinition.family}:*`;
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({
         actions: ['ecs:RunTask'],
         resources: [dbInitTaskDefArnPattern, k6TaskDefArnPattern],
@@ -301,10 +317,10 @@ export class OrchestrationStack extends cdk.Stack {
     // ecs:StopTask/DescribeTasks have no resource-level permissions —
     // AWS-required "*" (the specific task ARN doesn't exist until RunTask
     // creates it, so it can't be pre-scoped).
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({ actions: ['ecs:StopTask', 'ecs:DescribeTasks'], resources: ['*'] })
     );
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({
         actions: ['iam:PassRole'],
         resources: [
@@ -316,17 +332,17 @@ export class OrchestrationStack extends cdk.Stack {
         conditions: { StringLike: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' } },
       })
     );
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({
         actions: ['events:PutTargets', 'events:PutRule', 'events:DescribeRule'],
-        resources: [`arn:aws:events:${this.region}:${this.account}:rule/StepFunctionsGetEventForECSTaskRule`],
+        resources: [`arn:aws:events:${this.region}:${this.account}:rule/StepFunctionsGetEventsForECSTaskRule`],
       })
     );
 
     // Direct AWS SDK integration (ecs:describeServices) for the rollout
     // stabilization poll loop — DescribeServices has no resource-level
     // permissions either, AWS-required "*".
-    stateMachineRole.addToPolicy(
+    addStateMachinePolicy(
       new iam.PolicyStatement({ actions: ['ecs:DescribeServices'], resources: ['*'] })
     );
 
@@ -368,6 +384,15 @@ export class OrchestrationStack extends cdk.Stack {
       renderedDefinition = renderedDefinition.split(`\${${key}}`).join(value);
     }
 
+    // Attached as one explicit iam.Policy resource (not via
+    // stateMachineRole.addToPolicy per-statement) so the CfnStateMachine
+    // below can take an explicit CFN dependency on it — see the comment
+    // by addStateMachinePolicy's definition above.
+    const stateMachinePolicy = new iam.Policy(this, 'ExperimentStateMachinePolicy', {
+      statements: stateMachinePolicyStatements,
+    });
+    stateMachinePolicy.attachToRole(stateMachineRole);
+
     // Using the raw CfnStateMachine (rather than the sfn.StateMachine L2)
     // keeps this a literal deploy of the ASL file's own DefinitionString,
     // with no CDK-side reinterpretation of the state graph.
@@ -377,6 +402,15 @@ export class OrchestrationStack extends cdk.Stack {
       roleArn: stateMachineRole.roleArn,
       definitionString: renderedDefinition,
     });
+    // CreateStateMachine synchronously validates that the role can create
+    // the managed EventBridge rules its .sync integrations need — unlike
+    // Lambda's lazy invoke-time IAM checks. roleArn alone only orders this
+    // after the Role resource, not the separately-attached Policy, so
+    // without this the policy could still be mid-attach (or not even
+    // started) when CreateStateMachine runs, producing exactly the
+    // "not authorized to create managed-rule" AccessDenied seen on the
+    // first deploy attempt.
+    this.stateMachine.node.addDependency(stateMachinePolicy);
 
     // --- trigger (created last: needs the state machine's ARN) ----------
     this.triggerFunction = makeFunction(
