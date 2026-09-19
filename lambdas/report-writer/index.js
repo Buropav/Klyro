@@ -22,7 +22,7 @@ async function readJsonOptional(key) {
 }
 
 exports.handler = async (event) => {
-  const { runId } = event || {};
+  const { runId, error } = event || {};
   if (!runId) {
     throw new Error('runId is required in the event payload');
   }
@@ -35,6 +35,11 @@ exports.handler = async (event) => {
     readJsonOptional(`runs/${runId}/evaluation.json`),
   ]);
 
+  // Called two ways: normally at the end of a successful run (no error),
+  // or from the state machine's MarkFailed state after a Catch, with the
+  // failed state's error attached — a minimal report still gets written
+  // in that case, with whatever partial data existed at the point of
+  // failure, instead of the execution just erroring out with no artifact.
   const report = {
     runId,
     generatedAt: new Date().toISOString(),
@@ -49,8 +54,9 @@ exports.handler = async (event) => {
         }
       : null,
     metrics: { baseline: baselineSummary, optimized: optimizedSummary },
-    verdict: evaluation ? evaluation.verdict : null,
+    verdict: error ? 'FAILED' : evaluation ? evaluation.verdict : null,
     evaluationDetails: evaluation ? evaluation.metrics : null,
+    error: error || null,
   };
 
   await s3.send(

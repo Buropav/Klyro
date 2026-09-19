@@ -38,9 +38,18 @@ build.addStackDependency(data);
 const orchestration = new OrchestrationStack(app, 'Klyro-OrchestrationStack', {
   env,
   runsBucket: data.runsBucket,
-  clusterName: compute.cluster.clusterName,
-  appServiceName: compute.appService.serviceName,
-  stateMachineArn: app.node.tryGetContext('stateMachineArn'),
+  vpc: network.vpc,
+  cluster: compute.cluster,
+  appService: compute.appService,
+  appTaskDefinition: compute.appTaskDefinition,
+  appRepository: data.appRepository,
+  dbInitTaskDefinition: compute.dbInitTaskDefinition,
+  dbInitSecurityGroup: compute.dbInitSecurityGroup,
+  k6TaskDefinition: compute.k6TaskDefinition,
+  k6SecurityGroup: compute.k6SecurityGroup,
+  appBuildProject: build.appBuildProject,
 });
+orchestration.addStackDependency(network);
 orchestration.addStackDependency(data);
 orchestration.addStackDependency(compute);
+orchestration.addStackDependency(build);
