@@ -3,9 +3,9 @@
 ## What this is
 An AWS-native pipeline that, given a Node/Express/Postgres demo app with two
 deliberately seeded performance issues, automatically: builds it, deploys it
-to an isolated ECS environment, load-tests it, uses two Groq-hosted LLM calls
-to diagnose and propose a code fix, rebuilds/redeploys/retests with the fix,
-and produces a deterministic before/after verdict.
+to an isolated ECS environment, load-tests it, uses two Mistral-hosted LLM
+calls to diagnose and propose a code fix, rebuilds/redeploys/retests with the
+fix, and produces a deterministic before/after verdict.
 
 ## Stack
 - Infra: AWS CDK, TypeScript, one app under infra/
@@ -14,12 +14,17 @@ and produces a deterministic before/after verdict.
 - Orchestration: Step Functions, using `.sync` service integrations for
   ECS RunTask and CodeBuild StartBuild wherever possible — do not write
   custom Lambda polling loops for build/task completion.
-- LLM: Groq API (OpenAI-compatible), models read from env vars
-  GROQ_MODEL_ANALYST and GROQ_MODEL_INVESTIGATOR, defaulting to
-  openai/gpt-oss-20b and openai/gpt-oss-120b. Access via a small
-  LLMProvider interface so the provider is swappable later.
+- LLM: Mistral API (OpenAI-compatible), models read from env vars
+  LLM_MODEL_ANALYST and LLM_MODEL_INVESTIGATOR, defaulting to
+  mistral-small-latest and mistral-large-latest. Access via a small
+  LLMProvider interface (implemented by MistralProvider) so the provider
+  is swappable later. Originally speced as Groq; switched because the
+  user already had a Mistral key and expected better rate limits for this
+  project's repeated-testing usage — the swap only touched base URL,
+  model IDs, and the SSM parameter/env var names, confirming the
+  LLMProvider abstraction actually does what it's for.
 - Storage: S3 (all artifacts keyed by runId), SSM Parameter Store
-  (SecureString) for the Groq API key — never a plaintext env var.
+  (SecureString) for the Mistral API key — never a plaintext env var.
 
 ## Non-negotiable invariants
 - Every artifact, image tag, and metric is keyed by `runId`
@@ -38,8 +43,8 @@ and produces a deterministic before/after verdict.
   "performance changed" from "optimization validated" — validated requires
   p95 improvement ≥10%, error-rate delta ≤0.5 percentage points, and CPU
   staying ≤95%, all under the same workload/data/infra.
-- Lambdas that call Groq stay outside the VPC — no NAT gateway needed for
-  the LLM calls.
+- Lambdas that call Mistral stay outside the VPC — no NAT gateway needed
+  for the LLM calls.
 - IAM: least privilege everywhere, especially the k6 task role
   (s3:PutObject scoped to runs/<runId>/* only, nothing broader).
 

@@ -68,16 +68,19 @@ function validateAgainstSchema(value, schema, path = '$') {
 
 const REQUEST_TIMEOUT_MS = 30000;
 
-class GroqProvider {
-  constructor({ apiKey, model, baseUrl = 'https://api.groq.com/openai/v1' }) {
-    if (!apiKey) throw new Error('GroqProvider requires apiKey');
-    if (!model) throw new Error('GroqProvider requires model');
+// Mistral's chat completions API is OpenAI-compatible (same request/
+// response shape as Groq's), so this only differs from a Groq client in
+// its base URL and error-message label.
+class MistralProvider {
+  constructor({ apiKey, model, baseUrl = 'https://api.mistral.ai/v1' }) {
+    if (!apiKey) throw new Error('MistralProvider requires apiKey');
+    if (!model) throw new Error('MistralProvider requires model');
     this.apiKey = apiKey;
     this.model = model;
     this.baseUrl = baseUrl;
   }
 
-  async _callGroq(systemPrompt, userPrompt) {
+  async _callApi(systemPrompt, userPrompt) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let res;
@@ -105,13 +108,13 @@ class GroqProvider {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`Groq API error ${res.status}: ${text.slice(0, 500)}`);
+      throw new Error(`Mistral API error ${res.status}: ${text.slice(0, 500)}`);
     }
 
     const body = await res.json();
     const content = body.choices?.[0]?.message?.content;
     if (typeof content !== 'string') {
-      throw new Error('Groq API response missing choices[0].message.content');
+      throw new Error('Mistral API response missing choices[0].message.content');
     }
     return content;
   }
@@ -125,7 +128,7 @@ class GroqProvider {
     let lastError;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const raw = await this._callGroq(systemPrompt, prompt);
+        const raw = await this._callApi(systemPrompt, prompt);
         const parsed = JSON.parse(raw);
         validateAgainstSchema(parsed, jsonSchema);
         return parsed;
@@ -141,4 +144,4 @@ class GroqProvider {
   }
 }
 
-module.exports = { GroqProvider, AI_FAILED, validateAgainstSchema };
+module.exports = { MistralProvider, AI_FAILED, validateAgainstSchema };
