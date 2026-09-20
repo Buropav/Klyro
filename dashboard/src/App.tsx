@@ -151,7 +151,9 @@ export default function App() {
 
         {report && <VerdictView report={report} />}
 
-        <RunHistoryView onSelectRun={handleSelectRun} />
+        {/* Keyed on the finished run so the history and trend chart pick
+            up a completed run without the user hitting refresh. */}
+        <RunHistoryView onSelectRun={handleSelectRun} refreshKey={report ? report.runId : ''} />
       </div>
     </div>
   );
