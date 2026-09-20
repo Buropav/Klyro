@@ -1,5 +1,5 @@
 import { motion } from 'motion/react';
-import { Circle, Loader2, CheckCircle2, XCircle } from 'lucide-react';
+import { Circle, Loader2, CheckCircle2, XCircle, MinusCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Stage, StageStatus } from '@/lib/pipelineTypes';
 
@@ -12,12 +12,16 @@ const NODE_STYLES: Record<StageStatus, string> = {
   active: 'border-cyan-400 text-cyan-300 bg-cyan-400/10',
   done: 'border-green-400 text-green-400 bg-green-400/10',
   failed: 'border-red-400 text-red-400 bg-red-400/10',
+  // Never reached because the run ended earlier — visually recessed so it
+  // doesn't read as "still queued".
+  skipped: 'border-border/40 text-muted-foreground/40 bg-card',
 };
 
 function NodeIcon({ status }: { status: StageStatus }) {
   if (status === 'active') return <Loader2 className="size-4 animate-spin" aria-hidden />;
   if (status === 'done') return <CheckCircle2 className="size-4" aria-hidden />;
   if (status === 'failed') return <XCircle className="size-4" aria-hidden />;
+  if (status === 'skipped') return <MinusCircle className="size-3.5" aria-hidden />;
   return <Circle className="size-3" aria-hidden />;
 }
 
@@ -26,6 +30,7 @@ function connectorClassName(nextStatus: StageStatus): string {
   if (nextStatus === 'active') return 'connector-flow';
   if (nextStatus === 'done') return 'bg-green-400/60';
   if (nextStatus === 'failed') return 'bg-red-400/60';
+  if (nextStatus === 'skipped') return 'bg-border/40';
   return 'bg-border';
 }
 

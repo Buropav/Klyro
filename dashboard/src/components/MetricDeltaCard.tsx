@@ -11,6 +11,16 @@ export interface MetricDeltaCardProps {
   decimals?: number;
   /** Whether a LOWER after-value counts as an improvement (true for p95/cpu/db-queries/error-rate). */
   lowerIsBetter?: boolean;
+  /**
+   * How to express the change. 'relative' is a percentage of the before
+   * value; 'absolute' is a plain difference in the metric's own unit.
+   *
+   * Error rate MUST use 'absolute': the evaluator's rule is a
+   * percentage-POINT delta (<= 0.5pp, see CLAUDE.md), so showing 0.1% ->
+   * 0.3% as "+200%" would contradict a verdict that considers that change
+   * passing.
+   */
+  deltaMode?: 'relative' | 'absolute';
 }
 
 export function MetricDeltaCard({
@@ -20,17 +30,31 @@ export function MetricDeltaCard({
   unit,
   decimals,
   lowerIsBetter = true,
+  deltaMode = 'relative',
 }: MetricDeltaCardProps) {
-  const rawDelta = before !== 0 ? ((after - before) / before) * 100 : null;
-  const improved = rawDelta === null ? null : lowerIsBetter ? after < before : after > before;
-  const deltaLabel = rawDelta === null ? '—' : `${rawDelta > 0 ? '+' : ''}${rawDelta.toFixed(0)}%`;
+  const bothFinite = Number.isFinite(before) && Number.isFinite(after);
+  const rawDelta =
+    !bothFinite ? null : deltaMode === 'absolute' ? after - before : before !== 0 ? ((after - before) / before) * 100 : null;
+  const improved = !bothFinite || after === before ? null : lowerIsBetter ? after < before : after > before;
+  const deltaLabel =
+    rawDelta === null
+      ? '—'
+      : deltaMode === 'absolute'
+        ? `${rawDelta > 0 ? '+' : ''}${rawDelta.toFixed(decimals ?? 2)}${unit === '%' ? 'pp' : ''}`
+        : `${rawDelta > 0 ? '+' : ''}${rawDelta.toFixed(0)}%`;
 
   const chartData = [{ metric: label, Before: before, After: after }];
+
+  // Only claim the success treatment when the metric actually improved.
+  // Previously an unknown delta (before === 0) fell through to
+  // 'optimized', so a 0% -> 5% error-rate regression rendered with the
+  // success glow.
+  const cardState = improved === true ? 'optimized' : 'baseline';
 
   return (
     <div
       className="card-glow rounded-lg border border-border bg-card p-5"
-      data-state={improved === false ? 'baseline' : 'optimized'}
+      data-state={cardState}
     >
       <div className="mb-3 flex items-center justify-between">
         <span className="text-xs font-medium text-muted-foreground">{label}</span>

@@ -148,6 +148,16 @@ export class OrchestrationStack extends cdk.Stack {
         new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: [runsBucket.arnForObjects(keyPattern)] })
       );
 
+    // The state machine's physical name is fixed, so both its ARN and its
+    // executions' ARN pattern are derivable before the CfnStateMachine
+    // itself exists — which report-writer (created earlier, below) needs,
+    // since it cannot reference this.stateMachine.attrArn yet. Declared
+    // once here so the name can never drift between the resource and the
+    // IAM statements that scope to it.
+    const stateMachineName = 'klyro-experiment';
+    const stateMachineArn = `arn:aws:states:${this.region}:${this.account}:stateMachine:${stateMachineName}`;
+    const executionArnPattern = `arn:aws:states:${this.region}:${this.account}:execution:${stateMachineName}:*`;
+
     const grantLlmKeyPoolAccess = (fn: lambda.Function, paramName: string) => {
       const paramArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${paramName}`;
       fn.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [paramArn] }));
@@ -255,8 +265,20 @@ export class OrchestrationStack extends cdk.Stack {
     this.reportWriterFunction = makeFunction(
       'ReportWriterFunction',
       'report-writer',
-      {},
+      // Used to derive this run's execution ARN for the per-stage timeline
+      // baked into report.json. Best-effort inside the handler — see the
+      // note on readTimeline() — so an unset value degrades to a null
+      // timeline rather than failing the report.
+      { STATE_MACHINE_ARN: stateMachineArn },
       { memoryMB: 128, timeoutSeconds: 30 }
+    );
+    // Same deterministic-ARN reasoning as statusFunction below: scoped to
+    // this state machine's own executions, never states:ListExecutions.
+    this.reportWriterFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['states:DescribeExecution', 'states:GetExecutionHistory'],
+        resources: [executionArnPattern],
+      })
     );
     grantGet(this.reportWriterFunction, 'runs/*/*/finding.json');
     grantGet(this.reportWriterFunction, 'runs/*/*/patch.verified.json');
@@ -431,7 +453,7 @@ export class OrchestrationStack extends cdk.Stack {
     // keeps this a literal deploy of the ASL file's own DefinitionString,
     // with no CDK-side reinterpretation of the state graph.
     this.stateMachine = new sfn.CfnStateMachine(this, 'ExperimentStateMachine', {
-      stateMachineName: 'klyro-experiment',
+      stateMachineName,
       stateMachineType: 'STANDARD',
       roleArn: stateMachineRole.roleArn,
       definitionString: renderedDefinition,
@@ -472,7 +494,7 @@ export class OrchestrationStack extends cdk.Stack {
     this.statusFunction.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['states:DescribeExecution', 'states:GetExecutionHistory'],
-        resources: [`arn:aws:states:${this.region}:${this.account}:execution:klyro-experiment:*`],
+        resources: [executionArnPattern],
       })
     );
 
