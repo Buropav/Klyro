@@ -1,11 +1,16 @@
 'use strict';
 
 // Thrown when an LLM call never produces valid, schema-conforming JSON
-// after one retry. Named (not just .name-tagged) AI_FAILED so a Step
-// Functions Catch on ["AI_FAILED"] matches this error's errorType
-// regardless of whether the runtime derives that from the constructor
-// name or the .name property — see CLAUDE.md: "mark the run AI_FAILED —
-// never silently switch models or providers mid-run."
+// after exhausting every pool entry plus one schema-repair retry. Named
+// (not just .name-tagged) AI_FAILED so a Step Functions Catch on
+// ["AI_FAILED"] matches this error's errorType regardless of whether the
+// runtime derives that from the constructor name or the .name property —
+// see CLAUDE.md: "mark the run AI_FAILED — never silently switch models
+// or providers mid-run." Rotating across a pre-configured pool of
+// keys/models/providers on rate-limit is a distinct, explicitly-
+// documented exception to that rule (see CLAUDE.md's LLM section) — it's
+// picking among options the user configured up front, not improvising a
+// fallback mid-run.
 class AI_FAILED extends Error {
   constructor(message, cause) {
     super(message);
@@ -68,94 +73,147 @@ function validateAgainstSchema(value, schema, path = '$') {
 
 const REQUEST_TIMEOUT_MS = 30000;
 
-// Mistral's chat completions API is OpenAI-compatible (same request/
-// response shape as Groq's), so this only differs from a Groq client in
-// its base URL and error-message label.
-class MistralProvider {
-  constructor({ apiKey, model, baseUrl = 'https://api.mistral.ai/v1' }) {
-    if (!apiKey) throw new Error('MistralProvider requires apiKey');
-    if (!model) throw new Error('MistralProvider requires model');
-    this.apiKey = apiKey;
-    this.model = model;
-    this.baseUrl = baseUrl;
+// Every provider Klyro has used (Mistral, Groq) exposes an OpenAI-
+// compatible /chat/completions endpoint, so one request function covers
+// all of them — a pool entry is just { apiKey, baseUrl, model }.
+async function callChatCompletions({ apiKey, baseUrl, model }, systemPrompt, userPrompt) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0,
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
   }
 
-  async _callApi(systemPrompt, userPrompt) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    let res;
-    try {
-      res = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          response_format: { type: 'json_object' },
-          temperature: 0,
-        }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`LLM API error ${res.status} (${baseUrl}, model=${model}): ${text.slice(0, 500)}`);
+    if (res.status === 429) {
+      err.rateLimited = true;
+      const retryAfterHeader = Number(res.headers.get('retry-after'));
+      err.retryAfterMs = (Number.isFinite(retryAfterHeader) ? retryAfterHeader : 3) * 1000;
     }
+    throw err;
+  }
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      const err = new Error(`Mistral API error ${res.status}: ${text.slice(0, 500)}`);
-      if (res.status === 429) {
-        // An immediate retry after a 429 has ~zero chance of succeeding.
-        // Honor Retry-After if given, else back off a fixed amount.
-        const retryAfterHeader = Number(res.headers.get('retry-after'));
-        err.retryAfterMs = (Number.isFinite(retryAfterHeader) ? retryAfterHeader : 3) * 1000;
+  const body = await res.json();
+  const content = body.choices?.[0]?.message?.content;
+  if (typeof content !== 'string') {
+    throw new Error(`LLM API response (${baseUrl}) missing choices[0].message.content`);
+  }
+  return content;
+}
+
+// Wraps a configured POOL of { apiKey, baseUrl, model } entries — which
+// may span multiple providers, not just multiple keys for one provider —
+// and rotates through them on rate limits. Each Analyst/Investigator
+// invocation gets its own instance (fresh pool position each call); there
+// is no cross-invocation state, by design — a "sticky" rotation position
+// would just mean every Lambda cold start re-tries whichever entry
+// happened to be rate-limited last time, no worse than starting at index 0.
+class LLMProvider {
+  constructor({ pool }) {
+    if (!Array.isArray(pool) || pool.length === 0) {
+      throw new Error('LLMProvider requires a non-empty pool array');
+    }
+    for (const entry of pool) {
+      if (!entry.apiKey || !entry.baseUrl || !entry.model) {
+        throw new Error('LLMProvider pool entries need apiKey, baseUrl, and model');
       }
-      throw err;
     }
+    this.pool = pool;
+    this.poolIndex = 0;
+  }
 
-    const body = await res.json();
-    const content = body.choices?.[0]?.message?.content;
-    if (typeof content !== 'string') {
-      throw new Error('Mistral API response missing choices[0].message.content');
-    }
-    return content;
+  current() {
+    return this.pool[this.poolIndex];
+  }
+
+  rotate() {
+    this.poolIndex = (this.poolIndex + 1) % this.pool.length;
   }
 
   // complete(systemPrompt, userPrompt, jsonSchema) -> parsed object.
-  // On JSON parse or schema validation failure, retries once with the
-  // error text appended to the user prompt; on second failure, throws
-  // AI_FAILED.
+  //
+  // Two independent retry budgets, spent in whichever order the errors
+  // actually occur:
+  //  - Rate limits (429): rotate to the next pool entry (a different
+  //    key, possibly a different provider/model entirely) and retry the
+  //    SAME prompt immediately — no backoff needed, since a different
+  //    entry has its own independent limit. Cycles through every entry
+  //    at most once before falling back to a single backoff-and-retry on
+  //    whichever entry it ended on, in case the whole pool is genuinely
+  //    exhausted rather than mid-burst.
+  //  - Schema/parse failures: retry once (same pool entry) with the
+  //    error text appended to the prompt, per CLAUDE.md's "retry the
+  //    same call once with the error appended... then mark the run
+  //    AI_FAILED."
+  // Exhausting both throws AI_FAILED.
   async complete(systemPrompt, userPrompt, jsonSchema) {
     let prompt = userPrompt;
     let lastError;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    let entriesTried = 0;
+    let usedSchemaRetry = false;
+
+    while (true) {
       try {
-        const raw = await this._callApi(systemPrompt, prompt);
+        const raw = await callChatCompletions(this.current(), systemPrompt, prompt);
         const parsed = JSON.parse(raw);
         validateAgainstSchema(parsed, jsonSchema);
         return parsed;
       } catch (err) {
         lastError = err;
-        if (attempt === 2) break;
-        if (err.retryAfterMs) {
-          // Rate-limited: back off, then retry the exact same prompt —
-          // appending "your response was invalid" would be actively
-          // wrong here, since the model never actually responded.
-          await new Promise((resolve) => setTimeout(resolve, Math.min(err.retryAfterMs, 10000)));
-        } else {
+
+        if (err.rateLimited) {
+          entriesTried += 1;
+          if (entriesTried < this.pool.length) {
+            this.rotate();
+            continue; // fresh entry, same prompt, no backoff needed
+          }
+          if (entriesTried === this.pool.length) {
+            // Every entry has now been tried at least once. One last
+            // backoff-and-retry on the current entry in case it was
+            // transient, then give up.
+            await new Promise((resolve) => setTimeout(resolve, Math.min(err.retryAfterMs, 10000)));
+            entriesTried += 1; // ensures this branch can't loop forever
+            continue;
+          }
+          break;
+        }
+
+        if (!usedSchemaRetry) {
+          usedSchemaRetry = true;
           prompt =
             `${userPrompt}\n\n---\nYour previous response was invalid: ${err.message}\n` +
             'Respond again with ONLY a single JSON object matching the required schema exactly — no prose, no markdown fences.';
+          continue;
         }
+
+        break;
       }
     }
-    throw new AI_FAILED(`LLM completion failed after retry: ${lastError?.message}`, lastError);
+    throw new AI_FAILED(
+      `LLM completion failed after trying ${this.pool.length} pool entr${this.pool.length === 1 ? 'y' : 'ies'}: ${lastError?.message}`,
+      lastError
+    );
   }
 }
 
-module.exports = { MistralProvider, AI_FAILED, validateAgainstSchema };
+module.exports = { LLMProvider, AI_FAILED, validateAgainstSchema };

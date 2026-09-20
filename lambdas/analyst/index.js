@@ -2,14 +2,13 @@
 
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
-const { MistralProvider } = require('../llm-provider');
+const { LLMProvider } = require('../llm-provider');
 
 const s3 = new S3Client({});
 const ssm = new SSMClient({});
 
 const BUCKET = process.env.RESULTS_BUCKET;
-const MISTRAL_API_KEY_PARAM = process.env.MISTRAL_API_KEY_PARAM;
-const LLM_MODEL_ANALYST = process.env.LLM_MODEL_ANALYST;
+const LLM_KEY_POOL_PARAM = process.env.LLM_KEY_POOL_PARAM;
 
 const FINDING_SCHEMA = {
   type: 'object',
@@ -35,12 +34,17 @@ Respond with ONLY a JSON object of this exact shape, no prose, no
 markdown fences:
 {"metric": "<one of the metric names from the summary>", "reasoning": "<why this metric is anomalous>", "severity": "low" | "medium" | "high"}`;
 
-let cachedApiKey;
-async function getMistralApiKey() {
-  if (cachedApiKey) return cachedApiKey;
-  const res = await ssm.send(new GetParameterCommand({ Name: MISTRAL_API_KEY_PARAM, WithDecryption: true }));
-  cachedApiKey = res.Parameter.Value;
-  return cachedApiKey;
+// Stored as one SecureString parameter holding a JSON array of
+// { apiKey, baseUrl, model } entries — possibly spanning multiple
+// providers (Mistral, Groq, ...), not just multiple keys for one
+// provider. Adding/removing/reordering pool entries for rotation (see
+// llm-provider/index.js) is an SSM update, not a redeploy.
+let cachedPool;
+async function getLlmKeyPool() {
+  if (cachedPool) return cachedPool;
+  const res = await ssm.send(new GetParameterCommand({ Name: LLM_KEY_POOL_PARAM, WithDecryption: true }));
+  cachedPool = JSON.parse(res.Parameter.Value);
+  return cachedPool;
 }
 
 async function readJson(key) {
@@ -58,8 +62,8 @@ exports.handler = async (event) => {
 
   const summary = await readJson(`runs/${runId}/${phase}/summary.json`);
 
-  const apiKey = await getMistralApiKey();
-  const provider = new MistralProvider({ apiKey, model: LLM_MODEL_ANALYST });
+  const pool = await getLlmKeyPool();
+  const provider = new LLMProvider({ pool });
 
   const userPrompt = `Metrics summary for run ${runId} (${phase}):\n${JSON.stringify(summary, null, 2)}`;
 
