@@ -26,14 +26,20 @@ export interface OrchestrationStackProps extends cdk.StackProps {
   builderInstanceId: string;
 }
 
-// Mistral, not Groq — CLAUDE.md originally specified Groq, but the user
-// already had a Mistral key in hand and Mistral's free-tier rate limits
-// suit this project's repeated-testing usage better; Mistral's API is
-// OpenAI-compatible so MistralProvider only differs from a Groq client in
-// base URL and model IDs (see lambdas/llm-provider/index.js).
-const MISTRAL_API_KEY_PARAM = '/klyro/mistral-api-key';
-const LLM_MODEL_ANALYST_DEFAULT = 'mistral-small-latest';
-const LLM_MODEL_INVESTIGATOR_DEFAULT = 'mistral-large-latest';
+// Each of analyst/investigator reads its own SSM SecureString parameter
+// holding a JSON array of { apiKey, baseUrl, model } pool entries — see
+// lambdas/llm-provider/index.js's LLMProvider for the rotation logic.
+// This pool now deliberately spans TWO providers (Mistral and Groq, two
+// keys each): Mistral's account-level rate limit made every request fail
+// outright, and Groq was the original CLAUDE.md spec anyway, so rather
+// than pick one, both are in the pool and LLMProvider rotates across all
+// four on a 429 — a live, deliberate exception to "never silently switch
+// providers mid-run," since these are pre-configured options, not an
+// improvised fallback. Analyst gets each provider's smaller/faster model,
+// Investigator gets each provider's larger/more-capable one, matching the
+// original single-provider defaults' intent.
+const LLM_KEY_POOL_ANALYST_PARAM = '/klyro/llm-key-pool-analyst';
+const LLM_KEY_POOL_INVESTIGATOR_PARAM = '/klyro/llm-key-pool-investigator';
 
 // Must match CLAUDE.md's Investigator allowlist exactly.
 const ALLOWLISTED_FILES = ['demo-app/src/orders.js', 'demo-app/src/logger.js', 'demo-app/config/logger.json'];
@@ -118,9 +124,10 @@ export class OrchestrationStack extends cdk.Stack {
         environment: { ...commonEnv, ...extraEnv },
         logGroup,
         // No vpc/vpcSubnets on any of these — they only talk to S3,
-        // CloudWatch, SSM, ECS's control plane, and Mistral's public API,
-        // none of which needs VPC access. Staying out of the VPC avoids a
-        // NAT gateway, same reasoning CLAUDE.md gives for the LLM calls.
+        // CloudWatch, SSM, ECS's control plane, and the LLM providers'
+        // public APIs, none of which needs VPC access. Staying out of the
+        // VPC avoids a NAT gateway, same reasoning CLAUDE.md gives for the
+        // LLM calls.
       });
     };
 
@@ -137,15 +144,11 @@ export class OrchestrationStack extends cdk.Stack {
         new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: [runsBucket.arnForObjects(keyPattern)] })
       );
 
-    const mistralParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${MISTRAL_API_KEY_PARAM}`;
     const ssmDefaultKmsKeyArn = `arn:aws:kms:${this.region}:${this.account}:alias/aws/ssm`;
-    const grantMistralAccess = (fn: lambda.Function) => {
-      fn.addToRolePolicy(
-        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [mistralParamArn] })
-      );
-      fn.addToRolePolicy(
-        new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [ssmDefaultKmsKeyArn] })
-      );
+    const grantLlmKeyPoolAccess = (fn: lambda.Function, paramName: string) => {
+      const paramArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${paramName}`;
+      fn.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [paramArn] }));
+      fn.addToRolePolicy(new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [ssmDefaultKmsKeyArn] }));
     };
 
     // --- metrics-compactor ------------------------------------------------
@@ -166,30 +169,24 @@ export class OrchestrationStack extends cdk.Stack {
     this.analystFunction = makeFunction(
       'AnalystFunction',
       'analyst',
-      {
-        MISTRAL_API_KEY_PARAM,
-        LLM_MODEL_ANALYST: process.env.LLM_MODEL_ANALYST || LLM_MODEL_ANALYST_DEFAULT,
-      },
+      { LLM_KEY_POOL_PARAM: LLM_KEY_POOL_ANALYST_PARAM },
       { timeoutSeconds: 90 }
     );
     grantGet(this.analystFunction, 'runs/*/*/summary.json');
     grantPutJson(this.analystFunction, 'runs/*/*/finding.json');
-    grantMistralAccess(this.analystFunction);
+    grantLlmKeyPoolAccess(this.analystFunction, LLM_KEY_POOL_ANALYST_PARAM);
 
     // --- investigator ---------------------------------------------------
     this.investigatorFunction = makeFunction(
       'InvestigatorFunction',
       'investigator',
-      {
-        MISTRAL_API_KEY_PARAM,
-        LLM_MODEL_INVESTIGATOR: process.env.LLM_MODEL_INVESTIGATOR || LLM_MODEL_INVESTIGATOR_DEFAULT,
-      },
+      { LLM_KEY_POOL_PARAM: LLM_KEY_POOL_INVESTIGATOR_PARAM },
       { timeoutSeconds: 90 }
     );
     grantGet(this.investigatorFunction, 'runs/*/*/finding.json');
     grantGet(this.investigatorFunction, 'runs/*/*/summary.json');
     grantPutJson(this.investigatorFunction, 'runs/*/*/patch.json');
-    grantMistralAccess(this.investigatorFunction);
+    grantLlmKeyPoolAccess(this.investigatorFunction, LLM_KEY_POOL_INVESTIGATOR_PARAM);
 
     // --- guard ------------------------------------------------------------
     this.guardFunction = makeFunction('GuardFunction', 'guard', {}, { memoryMB: 128, timeoutSeconds: 30 });
