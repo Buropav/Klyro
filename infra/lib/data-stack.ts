@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
@@ -105,8 +106,31 @@ export class DataStack extends cdk.Stack {
     // — fewer new resources). Public access is via CloudFront below when
     // enabled; otherwise this stays private, same as before CloudFront
     // was written (see ENABLE_CLOUDFRONT above).
+    // dashboard/dist is a build artifact and is gitignored, so on a fresh
+    // clone it does not exist. Source.asset() on a missing directory throws
+    // at SYNTH time, which would break `cdk synth`/`diff`/`deploy`/`ls` for
+    // every stack in the app, not just this one. Fall back to a placeholder
+    // page and a loud warning so the CDK app stays synthesizable before the
+    // dashboard has been built.
+    const dashboardDist = path.join(__dirname, '..', '..', 'dashboard', 'dist');
+    const dashboardBuilt = fs.existsSync(path.join(dashboardDist, 'index.html'));
+    if (!dashboardBuilt) {
+      cdk.Annotations.of(this).addWarning(
+        'dashboard/dist not found — deploying a placeholder page. Run `npm ci && npm run build` in dashboard/ and redeploy DataStack to publish the real dashboard.'
+      );
+    }
+
     new s3deploy.BucketDeployment(this, 'DashboardDeployment', {
-      sources: [s3deploy.Source.asset(path.join(__dirname, '..', '..', 'dashboard', 'dist'))],
+      sources: [
+        dashboardBuilt
+          ? s3deploy.Source.asset(dashboardDist)
+          : s3deploy.Source.data(
+              'index.html',
+              '<!doctype html><meta charset="utf-8"><title>Klyro</title>' +
+                '<body style="background:#0A0B0E;color:#e5e7eb;font-family:ui-sans-serif,system-ui;padding:3rem">' +
+                '<h1>Klyro</h1><p>Dashboard not built yet. Run <code>npm run build</code> in <code>dashboard/</code> and redeploy DataStack.</p>'
+            ),
+      ],
       destinationBucket: this.runsBucket,
       destinationKeyPrefix: 'dashboard',
       // Short, not "none": CloudFront caches at the edge regardless of

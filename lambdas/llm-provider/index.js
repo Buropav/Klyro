@@ -98,6 +98,13 @@ async function callChatCompletions({ apiKey, baseUrl, model }, systemPrompt, use
       }),
       signal: controller.signal,
     });
+  } catch (err) {
+    // AbortError (the REQUEST_TIMEOUT_MS deadline above), DNS failures, TLS
+    // errors, connection resets — none of these are the model getting the
+    // schema wrong, so they rotate rather than burning the schema-repair
+    // budget on a prompt the provider never even saw.
+    err.transient = true;
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -107,8 +114,17 @@ async function callChatCompletions({ apiKey, baseUrl, model }, systemPrompt, use
     const err = new Error(`LLM API error ${res.status} (${baseUrl}, model=${model}): ${text.slice(0, 500)}`);
     if (res.status === 429) {
       err.rateLimited = true;
+      // Retry-After may legally be an HTTP-date, which Number() turns into
+      // NaN — fall back to 3s. Also floor it: a literal `Retry-After: 0`
+      // would otherwise become an immediate hammer-retry.
       const retryAfterHeader = Number(res.headers.get('retry-after'));
-      err.retryAfterMs = (Number.isFinite(retryAfterHeader) ? retryAfterHeader : 3) * 1000;
+      const seconds = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0 ? retryAfterHeader : 3;
+      err.retryAfterMs = seconds * 1000;
+    } else if (res.status >= 500) {
+      // 5xx is the provider being unhealthy, not the model being wrong —
+      // another pool entry (often a different provider entirely) may well
+      // answer, so this is rotate-able rather than a schema failure.
+      err.transient = true;
     }
     throw err;
   }
@@ -116,7 +132,12 @@ async function callChatCompletions({ apiKey, baseUrl, model }, systemPrompt, use
   const body = await res.json();
   const content = body.choices?.[0]?.message?.content;
   if (typeof content !== 'string') {
-    throw new Error(`LLM API response (${baseUrl}) missing choices[0].message.content`);
+    // A well-formed HTTP 200 that carries no completion is this provider
+    // misbehaving, not the model producing bad JSON — rotate, don't try to
+    // "repair" a response that never arrived.
+    const err = new Error(`LLM API response (${baseUrl}) missing choices[0].message.content`);
+    err.transient = true;
+    throw err;
   }
   return content;
 }
@@ -154,22 +175,26 @@ class LLMProvider {
   //
   // Two independent retry budgets, spent in whichever order the errors
   // actually occur:
-  //  - Rate limits (429): rotate to the next pool entry (a different
-  //    key, possibly a different provider/model entirely) and retry the
-  //    SAME prompt immediately — no backoff needed, since a different
-  //    entry has its own independent limit. Cycles through every entry
-  //    at most once before falling back to a single backoff-and-retry on
-  //    whichever entry it ended on, in case the whole pool is genuinely
-  //    exhausted rather than mid-burst.
-  //  - Schema/parse failures: retry once (same pool entry) with the
-  //    error text appended to the prompt, per CLAUDE.md's "retry the
-  //    same call once with the error appended... then mark the run
-  //    AI_FAILED."
+  //  - Rotate-able failures: a 429 (this key/account is rate limited) or
+  //    a transient provider fault (5xx, timeout, connection error, a 200
+  //    with no completion in it). Both mean "this entry can't answer right
+  //    now" rather than "the model got it wrong", so they rotate to the
+  //    next pool entry — a different key, often a different provider
+  //    entirely — and retry the SAME prompt. Cycles through every entry at
+  //    most once, then falls back to a single backoff-and-retry starting
+  //    from the front of the pool, in case the whole pool was mid-burst
+  //    rather than genuinely exhausted.
+  //  - Schema/parse failures: the model DID answer, it just answered
+  //    wrongly. Retry once on the SAME pool entry with the error text
+  //    appended, per CLAUDE.md's "retry the same call once with the error
+  //    appended... then mark the run AI_FAILED." Never rotates — rotating
+  //    here is exactly the silent provider switch CLAUDE.md forbids.
   // Exhausting both throws AI_FAILED.
   async complete(systemPrompt, userPrompt, jsonSchema) {
     let prompt = userPrompt;
     let lastError;
-    let entriesTried = 0;
+    let rotations = 0;
+    let usedBackoffRetry = false;
     let usedSchemaRetry = false;
 
     while (true) {
@@ -181,18 +206,20 @@ class LLMProvider {
       } catch (err) {
         lastError = err;
 
-        if (err.rateLimited) {
-          entriesTried += 1;
-          if (entriesTried < this.pool.length) {
+        if (err.rateLimited || err.transient) {
+          if (rotations < this.pool.length - 1) {
             this.rotate();
+            rotations += 1;
             continue; // fresh entry, same prompt, no backoff needed
           }
-          if (entriesTried === this.pool.length) {
-            // Every entry has now been tried at least once. One last
-            // backoff-and-retry on the current entry in case it was
-            // transient, then give up.
-            await new Promise((resolve) => setTimeout(resolve, Math.min(err.retryAfterMs, 10000)));
-            entriesTried += 1; // ensures this branch can't loop forever
+          if (!usedBackoffRetry) {
+            // Every entry has been tried once. Wait, then start over from
+            // the front of the pool rather than hammering the entry that
+            // happened to be last — it has had the longest time to recover.
+            usedBackoffRetry = true;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(err.retryAfterMs || 3000, 10000)));
+            this.rotate(); // wraps back to index 0
+            rotations += 1;
             continue;
           }
           break;
@@ -201,7 +228,11 @@ class LLMProvider {
         if (!usedSchemaRetry) {
           usedSchemaRetry = true;
           prompt =
-            `${userPrompt}\n\n---\nYour previous response was invalid: ${err.message}\n` +
+            `${userPrompt}
+
+---
+Your previous response was invalid: ${err.message}
+` +
             'Respond again with ONLY a single JSON object matching the required schema exactly — no prose, no markdown fences.';
           continue;
         }
@@ -209,10 +240,11 @@ class LLMProvider {
         break;
       }
     }
-    throw new AI_FAILED(
-      `LLM completion failed after trying ${this.pool.length} pool entr${this.pool.length === 1 ? 'y' : 'ies'}: ${lastError?.message}`,
-      lastError
-    );
+    // Describe what actually happened rather than always blaming the pool:
+    // "failed after trying 4 pool entries" sends you debugging rate limits
+    // when the real cause was one model returning malformed JSON twice.
+    const cause = usedSchemaRetry && rotations === 0 ? 'schema validation failed twice on the same entry' : `rotated through ${rotations + 1} of ${this.pool.length} pool entries`;
+    throw new AI_FAILED(`LLM completion failed (${cause}): ${lastError?.message}`, lastError);
   }
 }
 
