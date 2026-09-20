@@ -3,7 +3,7 @@
 const crypto = require('node:crypto');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
-const { MistralProvider } = require('../llm-provider');
+const { LLMProvider } = require('../llm-provider');
 // Generated at CDK synth time (orchestration-stack.ts) from the actual
 // current content of the three allowlisted demo-app files. Shared with
 // guard/, which independently re-verifies against the same manifest.
@@ -13,8 +13,7 @@ const s3 = new S3Client({});
 const ssm = new SSMClient({});
 
 const BUCKET = process.env.RESULTS_BUCKET;
-const MISTRAL_API_KEY_PARAM = process.env.MISTRAL_API_KEY_PARAM;
-const LLM_MODEL_INVESTIGATOR = process.env.LLM_MODEL_INVESTIGATOR;
+const LLM_KEY_POOL_PARAM = process.env.LLM_KEY_POOL_PARAM;
 
 const ALLOWLIST = Object.keys(allowlistManifest);
 
@@ -59,12 +58,12 @@ function sha256(content) {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
-let cachedApiKey;
-async function getMistralApiKey() {
-  if (cachedApiKey) return cachedApiKey;
-  const res = await ssm.send(new GetParameterCommand({ Name: MISTRAL_API_KEY_PARAM, WithDecryption: true }));
-  cachedApiKey = res.Parameter.Value;
-  return cachedApiKey;
+let cachedPool;
+async function getLlmKeyPool() {
+  if (cachedPool) return cachedPool;
+  const res = await ssm.send(new GetParameterCommand({ Name: LLM_KEY_POOL_PARAM, WithDecryption: true }));
+  cachedPool = JSON.parse(res.Parameter.Value);
+  return cachedPool;
 }
 
 async function readJson(key) {
@@ -125,8 +124,8 @@ exports.handler = async (event) => {
     2
   );
 
-  const apiKey = await getMistralApiKey();
-  const provider = new MistralProvider({ apiKey, model: LLM_MODEL_INVESTIGATOR });
+  const pool = await getLlmKeyPool();
+  const provider = new LLMProvider({ pool });
 
   const patch = await provider.complete(SYSTEM_PROMPT, userPrompt, PATCH_SCHEMA);
 
