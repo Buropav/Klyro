@@ -80,7 +80,11 @@ export class BuildStack extends cdk.Stack {
     // parameterized entirely via environment variables SSM RunCommand
     // sets on each invocation (see statemachine/experiment.asl.json).
     const buildScript = `#!/bin/bash
-set -eu
+# pipefail matters here: the 'aws ecr get-login-password | docker login'
+# pipeline below reports only docker login's exit code without it, so a
+# failed credential fetch would look like a successful login and surface
+# much later as an opaque 'no basic auth credentials' on docker push.
+set -euo pipefail
 : "\${RUN_ID:?RUN_ID is required}"
 : "\${PHASE:?PHASE is required}"
 
@@ -88,9 +92,27 @@ ECR_REPOSITORY_URI="${appRepository.repositoryUri}"
 RESULTS_BUCKET="${runsBucket.bucketName}"
 REGION="${this.region}"
 
+# docker login takes a REGISTRY host, not a repository URI. repositoryUri
+# is "<acct>.dkr.ecr.<region>.amazonaws.com/klyro-app"; passing the path
+# component too makes docker store the credential under the wrong key, and
+# the later push fails with "no basic auth credentials". Strip to the host.
+ECR_REGISTRY="\${ECR_REPOSITORY_URI%%/*}"
+
+if [ ! -f /opt/klyro/.bootstrap-ok ]; then
+  echo "Builder instance user-data did not complete (missing /opt/klyro/.bootstrap-ok)." >&2
+  exit 1
+fi
+
 echo "Building runId=$RUN_ID phase=$PHASE"
 
-aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URI"
+# Reclaim space before each build: this is a long-lived instance and every
+# run leaves two more tagged images plus build cache behind. On the default
+# 8 GiB AL2023 root volume that fills after a handful of runs, and the only
+# symptom is an SSM "Failed" with "no space left on device".
+docker image prune -af --filter "until=24h" || true
+docker builder prune -af --filter "until=24h" || true
+
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 WORKDIR="/tmp/klyro-build-$RUN_ID-$PHASE"
 rm -rf "$WORKDIR"
@@ -103,7 +125,11 @@ unzip -q ./baseline.zip
 if [ "$PHASE" = "optimized" ]; then
   echo "Applying guarded patch for $RUN_ID..."
   aws s3 cp "s3://$RESULTS_BUCKET/runs/$RUN_ID/baseline/patch.verified.json" ./patch.json
-  node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('./patch.json','utf8'));fs.writeFileSync(p.file,p.full_new_content,'utf8');console.log('Patched',p.file);"
+  # guard/ already enforces the allowlist upstream, but this is the one
+  # place that actually writes to disk as root, so it re-checks rather than
+  # trusting its input: the resolved target must stay inside the unpacked
+  # source tree and must already exist.
+  node -e "const fs=require('fs'),path=require('path');const p=JSON.parse(fs.readFileSync('./patch.json','utf8'));const root=path.resolve('demo-app');const t=path.resolve(p.file);if(t!==root&&!t.startsWith(root+path.sep))throw new Error('patch target escapes demo-app/: '+p.file);if(!fs.existsSync(t))throw new Error('patch target does not exist: '+p.file);fs.writeFileSync(t,p.full_new_content,'utf8');console.log('Patched',p.file);"
 fi
 
 IMAGE_TAG="$RUN_ID-$PHASE"
@@ -128,7 +154,12 @@ echo "Build complete: $ECR_REPOSITORY_URI:$IMAGE_TAG"
       "cat > /opt/klyro/build.sh << 'BUILD_SCRIPT_EOF'",
       buildScript,
       'BUILD_SCRIPT_EOF',
-      'chmod +x /opt/klyro/build.sh'
+      'chmod +x /opt/klyro/build.sh',
+      // Marker file written only if everything above succeeded. Nothing
+      // signals user-data failure back to CloudFormation, so without this
+      // a failed bootstrap shows up as a green BuildStack and then a first
+      // run that dies with 'No such file or directory'. build.sh checks it.
+      'touch /opt/klyro/.bootstrap-ok'
     );
 
     this.builderInstance = new ec2.Instance(this, 'BuilderInstance', {
@@ -140,6 +171,19 @@ echo "Build complete: $ECR_REPOSITORY_URI:$IMAGE_TAG"
       securityGroup,
       role: builderRole,
       userData,
+      // AL2023's default root volume is 8 GiB, which a Node image build
+      // plus two retained tags per run exhausts quickly. 30 GiB is the
+      // free-tier EBS ceiling, so this costs nothing extra and removes the
+      // most common opaque build failure.
+      blockDevices: [
+        {
+          deviceName: '/dev/xvda',
+          volume: ec2.BlockDeviceVolume.ebs(30, { volumeType: ec2.EbsDeviceVolumeType.GP3, encrypted: true }),
+        },
+      ],
+      // IMDSv2-only: this box holds a role that can push to ECR and read
+      // the runs bucket, and it sits in a public subnet.
+      requireImdsv2: true,
       // Public IP, no NAT — same reasoning as every other component in
       // this VPC: pulling images (ECR + Docker Hub for node:20-alpine)
       // and reaching SSM's endpoints both need outbound internet, and
