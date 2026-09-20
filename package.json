@@ -1,0 +1,8 @@
+{
+  "name": "klyro",
+  "private": true,
+  "description": "Klyro — repo-root test runner. The Lambdas have no package.json of their own (they use the nodejs20.x runtime's bundled AWS SDK v3), so these tests use Node's built-in test runner and need no install.",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
