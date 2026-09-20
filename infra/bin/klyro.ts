@@ -8,9 +8,16 @@ import { OrchestrationStack } from '../lib/orchestration-stack';
 
 const app = new cdk.App();
 
+// CLAUDE.md pins this project to ap-south-1. Reading CDK_DEFAULT_REGION
+// first did NOT honour that: the CDK CLI injects that variable into the
+// app's environment from whatever region the caller's AWS profile resolves
+// to (us-east-1 when none is configured), so the fallback could never be
+// reached and a teammate with a differently-configured profile would
+// silently deploy the whole stack to the wrong region. KLYRO_REGION is an
+// explicit, project-owned override instead.
 const env = {
   account: process.env.CDK_DEFAULT_ACCOUNT,
-  region: process.env.CDK_DEFAULT_REGION || 'ap-south-1',
+  region: process.env.KLYRO_REGION || 'ap-south-1',
 };
 
 const network = new NetworkStack(app, 'Klyro-NetworkStack', { env });

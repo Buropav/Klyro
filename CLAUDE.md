@@ -78,10 +78,10 @@ fix, and produces a deterministic before/after verdict.
   else builds on — every numeric readout in the app should go through
   AnimatedNumber (font-mono, unit-aware: ms/%/req-s), and every
   pending/active/done/failed/validated/rejected state through
-  StatusBadge, rather than ad hoc spans. src/App.tsx is currently a
-  component demo route with mock props (`npm run dev`), not the real
-  run-report view — wiring it to runs/<runId>/report.json from S3 is
-  still open work.
+  StatusBadge, rather than ad hoc spans. src/App.tsx is wired to the live
+  HTTP API: POST /run to start a run, GET /status/{runId} polled while it
+  runs, then runs/<runId>/report.json fetched directly from S3 (public-read
+  on that one key pattern) once the execution is terminal.
 - Dashboard design tokens (src/index.css): background #0A0B0E, card
   #12141A (slightly lighter, with a border-glow on hover/active via the
   .card-glow class + data-state="baseline"|"optimized"), two gradients —
@@ -180,6 +180,16 @@ fix, and produces a deterministic before/after verdict.
 
 ## Conventions
 - All Lambdas: Node 20, one handler per directory under lambdas/.
+- Lambda code is packaged from lambdas/ as a whole, so modules under
+  lambdas/shared/ are requirable from every handler with no bundler and no
+  dependency. Pure logic worth testing lives there and stays free of any
+  AWS import — handlers pull in @aws-sdk/* at module load, which only
+  resolves inside the Lambda runtime, so anything importing a handler
+  cannot run locally. That is why evaluate() is in shared/verdict.js and
+  verifyPatch() is in shared/patchGuard.js taking its manifest as a
+  parameter rather than requiring the gitignored generated one.
+- Tests live in tests/ and use Node's built-in runner (`npm test` at the
+  repo root). No install, no AWS, no cdk synth required.
 - All JSON the LLMs must produce is validated against a fixed schema in
   code; on a parse/validation failure, retry the same call once (same
   pool entry) with the error appended to the prompt, then mark the run
@@ -188,3 +198,9 @@ fix, and produces a deterministic before/after verdict.
   limit (see LLM section above) is the one sanctioned exception.
 - Keep everything in `ap-south-1` (Mumbai — closest region to the user,
   chosen over the original us-east-1 default) unless told otherwise.
+  infra/bin/klyro.ts reads KLYRO_REGION, deliberately NOT
+  CDK_DEFAULT_REGION: the CDK CLI injects the latter into the app's
+  environment from whatever region the caller's profile resolves to
+  (us-east-1 when none is configured), so an `|| 'ap-south-1'` fallback on
+  it could never actually be reached and a differently-configured profile
+  would silently deploy everything to the wrong region.
