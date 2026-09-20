@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens — dark theme only, no light variant (see CLAUDE.md's
+ * Dashboard section). Hex values kept literal here per the design brief
+ * rather than converted to the HSL-triplet form shadcn's default
+ * template uses, so this file stays the single source of truth you can
+ * eyeball against the spec.
+ */
+:root {
+  --background: #0a0b0e;
+  --foreground: #e7e9ee;
+
+  --card: #12141a;
+  --card-foreground: #e7e9ee;
+
+  --border: #23262f;
+  --input: #23262f;
+
+  --muted: #171922;
+  --muted-foreground: #8a8f9c;
+
+  --primary: #22d3ee;
+  --primary-foreground: #06161a;
+
+  --secondary: #171922;
+  --secondary-foreground: #e7e9ee;
+
+  --accent: #1b1e29;
+  --accent-foreground: #e7e9ee;
+
+  --destructive: #ef4444;
+  --destructive-foreground: #1a0404;
+
+  --ring: #22d3ee;
+  --radius: 0.75rem;
+
+  /* "baseline" state: cool cyan-to-violet */
+  --gradient-baseline-from: #22d3ee;
+  --gradient-baseline-to: #8b5cf6;
+
+  /* "optimized / validated" state: amber-to-green */
+  --gradient-optimized-from: #f59e0b;
+  --gradient-optimized-to: #22c55e;
+
+  --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+  /* All numeric readouts (metrics, counters) use the mono stack — set on
+     the specific components (AnimatedNumber etc.) rather than globally,
+     since most of the UI is labels/prose in font-sans. */
+}
+
+@layer components {
+  /* Subtle border-glow on hover/active, tinted per state. Applied via
+     data-state="baseline" | "optimized" on the card element. */
+  .card-glow {
+    @apply transition-[box-shadow,border-color] duration-200 ease-out;
+  }
+  .card-glow[data-state='baseline']:hover,
+  .card-glow[data-state='baseline'][data-active='true'] {
+    border-color: rgba(34, 211, 238, 0.4);
+    @apply shadow-glow-baseline;
+  }
+  .card-glow[data-state='optimized']:hover,
+  .card-glow[data-state='optimized'][data-active='true'] {
+    border-color: rgba(245, 158, 11, 0.4);
+    @apply shadow-glow-optimized;
+  }
+
+  /* PipelineView's connector line while its target node is 'active' — a
+     moving highlight sweeping cyan-to-violet along the line, distinct
+     from the solid fill a settled (done/failed) connector gets. */
+  .connector-flow {
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--gradient-baseline-from) 45%,
+      var(--gradient-baseline-to) 55%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: connector-flow-move 1.4s linear infinite;
+  }
+  @keyframes connector-flow-move {
+    from {
+      background-position: 100% 0;
+    }
+    to {
+      background-position: -100% 0;
+    }
+  }
+}
