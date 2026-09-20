@@ -1,6 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
+import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
+import * as apigwv2i from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
@@ -49,6 +51,8 @@ const APP_CONTAINER_NAME = 'app';
 
 export class OrchestrationStack extends cdk.Stack {
   public readonly triggerFunction: lambda.Function;
+  public readonly statusFunction: lambda.Function;
+  public readonly listRunsFunction: lambda.Function;
   public readonly metricsCompactorFunction: lambda.Function;
   public readonly analystFunction: lambda.Function;
   public readonly investigatorFunction: lambda.Function;
@@ -439,7 +443,80 @@ export class OrchestrationStack extends cdk.Stack {
       new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [this.stateMachine.attrArn] })
     );
 
+    // --- status (polls a run's Step Functions execution) ----------------
+    this.statusFunction = makeFunction(
+      'StatusFunction',
+      'status',
+      { STATE_MACHINE_ARN: this.stateMachine.attrArn },
+      { memoryMB: 128, timeoutSeconds: 15 }
+    );
+    // Execution ARNs are derived deterministically inside status/index.js
+    // (":stateMachine:" -> ":execution:" + runId, since trigger/ always
+    // names executions after runId) rather than looked up, so this only
+    // needs read access scoped to this one state machine's own
+    // executions — not states:ListExecutions or anything broader.
+    this.statusFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['states:DescribeExecution', 'states:GetExecutionHistory'],
+        resources: [`arn:aws:states:${this.region}:${this.account}:execution:klyro-experiment:*`],
+      })
+    );
+
+    // --- list-runs (run history) -----------------------------------------
+    this.listRunsFunction = makeFunction('ListRunsFunction', 'list-runs', {}, { memoryMB: 256, timeoutSeconds: 30 });
+    grantGet(this.listRunsFunction, 'runs/*/report.json');
+    // Same scoped-to-runs/ s3:ListBucket grant as reportWriterFunction
+    // above — ListObjectsV2 is a bucket-level action, so it can't be
+    // scoped via a resource ARN the way GetObject is; the s3:prefix
+    // condition is what keeps this from being bucket-wide.
+    this.listRunsFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket'],
+        resources: [runsBucket.bucketArn],
+        conditions: { StringLike: { 's3:prefix': 'runs/*' } },
+      })
+    );
+
+    // Public HTTP API in front of trigger/ and status/ so the dashboard
+    // can POST /run and poll GET /status/{runId} directly from the
+    // browser — both were invoke-only ("aws lambda invoke") until now.
+    // No auth: this is a judge-facing demo, not a multi-tenant control
+    // plane — trigger/ only ever starts a brand-new, self-contained run,
+    // and status/ only ever reads that run's own already-public
+    // execution progress (the same information report.json exposes once
+    // the run finishes). CORS is origin '*': the brief asked for the
+    // dashboard's CloudFront domain specifically, but no CloudFront
+    // distribution exists in this project (the dashboard is a private S3
+    // object opened via presigned URL — see CLAUDE.md's Dashboard
+    // section) — so this uses the same open-CORS approach already in use
+    // for /run rather than allowlisting a domain that doesn't exist yet.
+    const httpApi = new apigwv2.HttpApi(this, 'TriggerHttpApi', {
+      apiName: 'klyro-trigger-api',
+      corsPreflight: {
+        allowOrigins: ['*'],
+        allowMethods: [apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.GET, apigwv2.CorsHttpMethod.OPTIONS],
+        allowHeaders: ['content-type'],
+      },
+    });
+    httpApi.addRoutes({
+      path: '/run',
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2i.HttpLambdaIntegration('TriggerIntegration', this.triggerFunction),
+    });
+    httpApi.addRoutes({
+      path: '/status/{runId}',
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2i.HttpLambdaIntegration('StatusIntegration', this.statusFunction),
+    });
+    httpApi.addRoutes({
+      path: '/runs',
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2i.HttpLambdaIntegration('ListRunsIntegration', this.listRunsFunction),
+    });
+
     new cdk.CfnOutput(this, 'TriggerFunctionName', { value: this.triggerFunction.functionName });
     new cdk.CfnOutput(this, 'StateMachineArn', { value: this.stateMachine.attrArn });
+    new cdk.CfnOutput(this, 'HttpApiUrl', { value: httpApi.apiEndpoint });
+    new cdk.CfnOutput(this, 'TriggerApiUrl', { value: `${httpApi.apiEndpoint}/run` });
   }
 }

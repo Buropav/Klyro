@@ -1,6 +1,10 @@
 'use strict';
 
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+// Same manifest investigator/guard use — gives report-writer the
+// pre-patch content of the target file without a separate S3 read, so the
+// dashboard's diff view can be built from report.json alone.
+const allowlistManifest = require('../shared-allowlist-manifest.generated.json');
 
 const s3 = new S3Client({});
 const BUCKET = process.env.RESULTS_BUCKET;
@@ -49,8 +53,12 @@ exports.handler = async (event) => {
           file: patch.file,
           reason: patch.reason,
           expected_effect: patch.expected_effect,
-          // full_new_content deliberately omitted here — it lives in
-          // patch.verified.json; the report is a summary, not a blob.
+          // Dashboard (dashboard/index.html) renders a diff from report.json
+          // alone — it fetches nothing else from S3 — so both sides of the
+          // patch are embedded here rather than kept in patch.verified.json
+          // only.
+          old_content: allowlistManifest[patch.file],
+          new_content: patch.full_new_content,
         }
       : null,
     metrics: { baseline: baselineSummary, optimized: optimizedSummary },
