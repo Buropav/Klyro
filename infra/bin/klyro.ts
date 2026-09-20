@@ -30,9 +30,11 @@ compute.addStackDependency(data);
 
 const build = new BuildStack(app, 'Klyro-BuildStack', {
   env,
+  vpc: network.vpc,
   appRepository: data.appRepository,
   runsBucket: data.runsBucket,
 });
+build.addStackDependency(network);
 build.addStackDependency(data);
 
 const orchestration = new OrchestrationStack(app, 'Klyro-OrchestrationStack', {
@@ -47,7 +49,7 @@ const orchestration = new OrchestrationStack(app, 'Klyro-OrchestrationStack', {
   dbInitSecurityGroup: compute.dbInitSecurityGroup,
   k6TaskDefinition: compute.k6TaskDefinition,
   k6SecurityGroup: compute.k6SecurityGroup,
-  appBuildProject: build.appBuildProject,
+  builderInstanceId: build.builderInstance.instanceId,
 });
 orchestration.addStackDependency(network);
 orchestration.addStackDependency(data);
