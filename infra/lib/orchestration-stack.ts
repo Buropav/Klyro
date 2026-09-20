@@ -148,11 +148,25 @@ export class OrchestrationStack extends cdk.Stack {
         new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: [runsBucket.arnForObjects(keyPattern)] })
       );
 
-    const ssmDefaultKmsKeyArn = `arn:aws:kms:${this.region}:${this.account}:alias/aws/ssm`;
     const grantLlmKeyPoolAccess = (fn: lambda.Function, paramName: string) => {
       const paramArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${paramName}`;
       fn.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [paramArn] }));
-      fn.addToRolePolicy(new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [ssmDefaultKmsKeyArn] }));
+      // kms:Decrypt for the SecureString above. This CANNOT be scoped to
+      // the alias ARN (arn:aws:kms:...:alias/aws/ssm): IAM evaluates
+      // kms:Decrypt against the resolved KEY ARN (.../key/<key-id>), so a
+      // statement naming the alias never matches and GetParameter with
+      // WithDecryption:true fails with AccessDenied at runtime. The
+      // AWS-managed key's id isn't knowable at synth time without a
+      // lookup, so the documented pattern is Resource:* narrowed by a
+      // kms:ViaService condition — which restricts this to decryption
+      // performed *by SSM on this function's behalf*, nothing else.
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ['kms:Decrypt'],
+          resources: ['*'],
+          conditions: { StringEquals: { 'kms:ViaService': `ssm.${this.region}.amazonaws.com` } },
+        })
+      );
     };
 
     // --- metrics-compactor ------------------------------------------------
