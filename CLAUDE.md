@@ -8,7 +8,15 @@ diagnose and propose a code fix, rebuilds/redeploys/retests with the
 fix, and produces a deterministic before/after verdict.
 
 ## Stack
-- Infra: AWS CDK, TypeScript, one app under infra/
+- Infra: AWS CDK, TypeScript, one app under infra/. cdk.json's
+  `@aws-cdk/core:validateAgainstDefaultRules` context flag is deliberately
+  `false` (not the CDK-generated default of `true`) — with it on, this
+  CDK CLI version (2.1142.0) crashes on every synth/deploy with
+  `IllegalPluginOperation: One of the validation plugins (Construct
+  Annotations) modified the cloud assembly`, a real bug in that
+  built-in plugin, not something in this project's own stacks. The flag
+  only gates an extra local pre-deploy lint pass (no effect on deployed
+  resources), so turning it off is a real fix, not a masked error.
 - Compute: ECS on Fargate (app service, db service, k6 task, db-init task)
 - Build: a persistent EC2 instance (Amazon Linux 2023 + Docker), driven by
   SSM RunCommand (`AWS-RunShellScript`), running the same build/patch/push
@@ -57,6 +65,96 @@ fix, and produces a deterministic before/after verdict.
   openai/gpt-oss-120b — Groq's actually-available model catalog was
   checked live via GET /v1/models rather than assumed) — adding,
   removing, or reordering keys is an SSM update, not a redeploy.
+- Dashboard: dashboard/ is a real React + Vite + TypeScript app (this
+  superseded an earlier single-static-file, no-build-step design — see
+  git history). Stack: Tailwind CSS v3 (classic config, not v4 — chosen
+  for compatibility with Tremor's documented setup, which still targets
+  v3), shadcn/ui (new-york style, dark-only — see below), Tremor
+  (@tremor/react) for charts/KPI cards, motion (the current Framer
+  Motion, imported from "motion/react") for the AnimatedNumber
+  count-up/down and card entrance animation, lucide-react for icons,
+  sonner for toasts. components/AnimatedNumber.tsx and
+  components/StatusBadge.tsx are the two reusable primitives everything
+  else builds on — every numeric readout in the app should go through
+  AnimatedNumber (font-mono, unit-aware: ms/%/req-s), and every
+  pending/active/done/failed/validated/rejected state through
+  StatusBadge, rather than ad hoc spans. src/App.tsx is currently a
+  component demo route with mock props (`npm run dev`), not the real
+  run-report view — wiring it to runs/<runId>/report.json from S3 is
+  still open work.
+- Dashboard design tokens (src/index.css): background #0A0B0E, card
+  #12141A (slightly lighter, with a border-glow on hover/active via the
+  .card-glow class + data-state="baseline"|"optimized"), two gradients —
+  cyan-to-violet (#22D3EE → #8B5CF6) for "baseline" state, amber-to-green
+  (#F59E0B → #22C55E) for "optimized/validated" state. Fonts: Geist Sans
+  for labels, Geist Mono for every numeric value, both loaded via Google
+  Fonts with ui-sans-serif/ui-monospace fallback stacks. Dark mode is the
+  only theme — `<html class="dark">` is set permanently in index.html,
+  no toggle component exists; darkMode:'class' stays in tailwind.config
+  only because Tremor's own components ship internal dark: variants that
+  expect the class to be present.
+- Dashboard deploy: data-stack.ts's BucketDeployment now uploads
+  dashboard/dist (the built Vite app — run `npm run build` in dashboard/
+  before every `cdk deploy` of DataStack, or it uploads a stale build;
+  there's no build step wired into the CDK deploy itself). Served
+  publicly via CloudFront (DashboardDistribution) in front of the same
+  runs bucket's dashboard/ prefix, through Origin Access Control (OAC) —
+  the modern replacement for OAI. originPath scopes every request the
+  distribution makes to dashboard/, so runs/* stays unreachable through
+  it even though the L2 origin construct's auto-generated bucket-policy
+  statement is technically s3:GetObject on the whole bucket (conditioned
+  on the distribution's own ARN, not key prefix — CDK doesn't expose a
+  narrower option here). Cache policy is a short 1-5min TTL, not the
+  default CACHING_OPTIMIZED, since there's no CloudFront invalidation
+  step after a deploy — a short TTL is what makes a redeploy actually
+  show up. DashboardUrl (a CfnOutput) is the real public entry point now;
+  the presigned-URL approach from before CloudFront existed still works
+  as a fallback but isn't the primary access path anymore.
+- HTTP API: OrchestrationStack's TriggerHttpApi (apigatewayv2, not a v1
+  REST API — every new route lands on the same HTTP API that already
+  served POST /run, rather than standing up a separate REST API, to keep
+  one API surface instead of several) serves POST /run (trigger/, starts
+  a new execution), GET /status/{runId} (status/, polls one), and GET
+  /runs (list-runs/, run history). No auth on any of them — this is a
+  judge-facing demo control plane, not multi-tenant, and none of the
+  three routes can read or mutate another run's data beyond what's
+  already public via report.json. CORS is origin '*' on all of them:
+  even now that DashboardDistribution (above) gives the dashboard a real
+  fixed domain, allowlisting it isn't obviously worth the coupling for a
+  demo project with no auth either way, so this was left as-is rather
+  than tightened. The dashboard reads the API's base URL from
+  VITE_API_BASE_URL (dashboard/.env, gitignored — see .env.example), set
+  from OrchestrationStack's HttpApiUrl output.
+- lambdas/list-runs/: lists runs/ via ListObjectsV2 (s3:ListBucket scoped
+  to the runs/ prefix via an s3:prefix condition — same pattern
+  report-writer's grant already uses, not bucket-wide), filters for keys
+  ending in /report.json (one per completed run), reads each one
+  (s3:GetObject scoped to runs/*/report.json) for its verdict, and
+  returns {runId, timestamp, verdict, guardRejected} sorted newest first.
+- lambdas/status/: given a runId, derives the Step Functions execution
+  ARN deterministically (swap ":stateMachine:" for ":execution:" on
+  STATE_MACHINE_ARN, append runId) rather than searching for it — this
+  works because trigger/ always names executions after runId. Calls
+  DescribeExecution + GetExecutionHistory, then collapses the ASL's ~45
+  real state names (statemachine/experiment.asl.json) down to 10
+  human-facing stages: Build, Deploy, Load Test, Diagnose, Patch,
+  Rebuild, Redeploy, Reset, Retest, Evaluate — MarkFailed/
+  ExperimentSucceeded/ExperimentFailed are deliberately excluded as
+  bookkeeping, not a stage. A stage is 'done' if any earlier stage's
+  states were entered more recently, 'active'/'failed' at whichever stage
+  the execution is currently in or died in (branching on overallStatus),
+  and 'pending' after that — see the STAGE_DEFINITIONS comment in
+  lambdas/status/index.js for the full mapping, including why
+  SeedDatabaseBaseline (runs in Parallel alongside BuildBaselineImage)
+  is folded into Build rather than getting its own stage.
+- Dashboard live-progress: PipelineView (src/components/PipelineView.tsx)
+  renders the 10 stages from GET /status/{runId} as a horizontal node row
+  with flowing-gradient connectors; usePipelineStatus polls it every 2s
+  while overallStatus is RUNNING and stops on any terminal status. Once
+  terminal, the dashboard starts polling report.json instead (see
+  useReportPolling) and swaps PipelineView out for VerdictView — that
+  swap on report.json's arrival is the whole "auto-navigate to the
+  verdict view" behavior; there's no client-side router.
 
 ## Non-negotiable invariants
 - Every artifact, image tag, and metric is keyed by `runId`
