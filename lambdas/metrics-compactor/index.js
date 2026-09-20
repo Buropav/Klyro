@@ -13,6 +13,12 @@ const EMF_NAMESPACE = process.env.EMF_NAMESPACE || 'Klyro/DemoApp';
 
 // Must match k6/load-script.js's "measurement" scenario duration.
 const MEASUREMENT_DURATION_SECONDS = 70;
+// Warmup span that precedes the measurement scenario in k6/load-script.js.
+// The CloudWatch window has to skip it: extractK6Metrics below reads only
+// the {phase:measurement} submetrics, so counting EMF datapoints from the
+// warmup too would divide a warmup+measurement numerator by a
+// measurement-only denominator in db_queries_per_request.
+const WARMUP_DURATION_SECONDS = 20;
 // Total wall-clock span of a k6 run (20s warmup + 70s measurement), used
 // only to guess a time window when the caller doesn't supply one.
 const TOTAL_TEST_DURATION_SECONDS = 90;
@@ -108,15 +114,25 @@ exports.handler = async (event) => {
     throw new Error('runId and phase are required in the event payload');
   }
 
+  // The state machine passes the k6 ECS task's real StartedAt/StoppedAt
+  // (RunK6*'s .sync result), so the CloudWatch window matches the actual
+  // load test rather than being inferred. Step Functions hands these over
+  // as epoch-millis numbers; new Date() takes those or an ISO string.
+  //
+  // The fallback below is for ad-hoc manual invocation only. It is a guess
+  // anchored to invocation time — which is AFTER the k6 task already
+  // stopped — so it will under-report CPU and EMF counts. Prefer passing
+  // the window explicitly.
   const now = new Date();
+  const measuredWindow = Boolean(event.startTime && event.endTime);
   const endTime = event.endTime ? new Date(event.endTime) : now;
-  // Fallback window is approximate (invocation-time based), intended for
-  // manual/ad-hoc testing. The state machine built in a later prompt has
-  // the real task start/stop times and should pass startTime/endTime
-  // explicitly instead of relying on this guess.
-  const startTime = event.startTime
+  const rawStart = event.startTime
     ? new Date(event.startTime)
     : new Date(endTime.getTime() - (TOTAL_TEST_DURATION_SECONDS + WINDOW_BUFFER_SECONDS) * 1000);
+  // Skip the warmup so numerator and denominator cover the same span.
+  const startTime = measuredWindow
+    ? new Date(Math.min(rawStart.getTime() + WARMUP_DURATION_SECONDS * 1000, endTime.getTime()))
+    : rawStart;
 
   const k6Summary = await readJson(`runs/${runId}/${phase}/results.json`);
   const k6Metrics = extractK6Metrics(k6Summary);
@@ -130,7 +146,11 @@ exports.handler = async (event) => {
   const summary = {
     runId,
     phase,
-    window: { start: startTime.toISOString(), end: endTime.toISOString() },
+    // measured=false means the window was guessed rather than taken from
+    // the k6 task's real start/stop times, so cpu_percent and db_queries
+    // are not trustworthy. The evaluator reads this to avoid passing its
+    // CPU check on telemetry that was never actually collected.
+    window: { start: startTime.toISOString(), end: endTime.toISOString(), measured: measuredWindow },
     requests: k6Metrics.requests,
     requests_per_second: k6Metrics.requests_per_second,
     p95_ms: k6Metrics.p95_ms,
