@@ -127,16 +127,21 @@ exports.handler = async (event) => {
   const pool = await getLlmKeyPool();
   const provider = new LLMProvider({ pool });
 
-  const patch = await provider.complete(SYSTEM_PROMPT, userPrompt, PATCH_SCHEMA);
+  const { data: patch, meta } = await provider.complete(SYSTEM_PROMPT, userPrompt, PATCH_SCHEMA);
+
+  // See the note in lambdas/analyst/index.js — additive provenance, kept
+  // separate from the model's own schema-validated output. guard/ reads
+  // patch.file / original_sha256 / full_new_content and ignores this.
+  const patch_ = { ...patch, _llm: meta };
 
   await s3.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: `runs/${runId}/${phase}/patch.json`,
-      Body: JSON.stringify(patch, null, 2),
+      Body: JSON.stringify(patch_, null, 2),
       ContentType: 'application/json',
     })
   );
 
-  return patch;
+  return patch_;
 };

@@ -67,16 +67,22 @@ exports.handler = async (event) => {
 
   const userPrompt = `Metrics summary for run ${runId} (${phase}):\n${JSON.stringify(summary, null, 2)}`;
 
-  const finding = await provider.complete(SYSTEM_PROMPT, userPrompt, FINDING_SCHEMA);
+  const { data: finding, meta } = await provider.complete(SYSTEM_PROMPT, userPrompt, FINDING_SCHEMA);
+
+  // _llm is additive and underscore-prefixed to keep it clearly distinct
+  // from the schema-validated fields the model itself produced — nothing
+  // downstream validates against it, and report-writer treats it as
+  // optional.
+  const finding_ = { ...finding, _llm: meta };
 
   await s3.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: `runs/${runId}/${phase}/finding.json`,
-      Body: JSON.stringify(finding, null, 2),
+      Body: JSON.stringify(finding_, null, 2),
       ContentType: 'application/json',
     })
   );
 
-  return finding;
+  return finding_;
 };

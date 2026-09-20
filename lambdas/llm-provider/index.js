@@ -130,6 +130,7 @@ async function callChatCompletions({ apiKey, baseUrl, model }, systemPrompt, use
   }
 
   const body = await res.json();
+  const usage = body.usage || null;
   const content = body.choices?.[0]?.message?.content;
   if (typeof content !== 'string') {
     // A well-formed HTTP 200 that carries no completion is this provider
@@ -139,7 +140,21 @@ async function callChatCompletions({ apiKey, baseUrl, model }, systemPrompt, use
     err.transient = true;
     throw err;
   }
-  return content;
+  return { content, usage };
+}
+
+// Human-readable provider name derived from the entry's baseUrl, for
+// report.json. Deliberately derived rather than stored: pool entries are
+// configured in SSM as { apiKey, baseUrl, model } and adding a required
+// 'provider' field would invalidate every existing parameter value.
+function providerLabel(baseUrl) {
+  try {
+    const host = new URL(baseUrl).hostname;
+    const parts = host.split('.').filter((p) => p !== 'www' && p !== 'api');
+    return parts.length >= 2 ? parts[parts.length - 2] : host;
+  } catch {
+    return 'unknown';
+  }
 }
 
 // Wraps a configured POOL of { apiKey, baseUrl, model } entries — which
@@ -171,7 +186,8 @@ class LLMProvider {
     this.poolIndex = (this.poolIndex + 1) % this.pool.length;
   }
 
-  // complete(systemPrompt, userPrompt, jsonSchema) -> parsed object.
+  // complete(systemPrompt, userPrompt, jsonSchema)
+  //   -> { data: <parsed object>, meta: <provenance> }
   //
   // Two independent retry budgets, spent in whichever order the errors
   // actually occur:
@@ -199,10 +215,26 @@ class LLMProvider {
 
     while (true) {
       try {
-        const raw = await callChatCompletions(this.current(), systemPrompt, prompt);
-        const parsed = JSON.parse(raw);
+        const entry = this.current();
+        const { content, usage } = await callChatCompletions(entry, systemPrompt, prompt);
+        const parsed = JSON.parse(content);
         validateAgainstSchema(parsed, jsonSchema);
-        return parsed;
+        // meta makes the pool's behaviour observable in report.json: which
+        // entry actually answered, and how much rotating/repairing it took
+        // to get there. Without it a run that survived a provider outage
+        // looks identical to one that succeeded first try.
+        return {
+          data: parsed,
+          meta: {
+            provider: providerLabel(entry.baseUrl),
+            model: entry.model,
+            poolSize: this.pool.length,
+            rotations,
+            schemaRepairUsed: usedSchemaRetry,
+            backoffRetryUsed: usedBackoffRetry,
+            usage,
+          },
+        };
       } catch (err) {
         lastError = err;
 
