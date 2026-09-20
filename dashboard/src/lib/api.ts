@@ -105,6 +105,6 @@ export async function listRuns(): Promise<RunSummary[]> {
     const body = await res.json().catch(() => null);
     throw new Error(body?.error || `List-runs API returned HTTP ${res.status}`);
   }
-  const { runs } = (await res.json()) as { runs: RunSummary[] };
+  const { runs } = (await res.json()) as { runs: RunSummary[]; truncated?: boolean };
   return runs;
 }
