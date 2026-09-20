@@ -14,15 +14,34 @@
               "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
                 "DocumentName": "AWS-RunShellScript",
-                "InstanceIds": ["${BuilderInstanceId}"],
+                "InstanceIds": [
+                  "${BuilderInstanceId}"
+                ],
                 "Parameters": {
                   "commands.$": "States.Array(States.Format('RUN_ID={} PHASE=baseline /opt/klyro/build.sh', $.runId))"
                 }
               },
               "ResultPath": "$.buildCommand",
+              "TimeoutSeconds": 60,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.TooManyUpdatesException",
+                    "Ssm.ThrottlingException",
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
               "Next": "WaitForBaselineCommandRegistration"
             },
-            "WaitForBaselineCommandRegistration": { "Type": "Wait", "Seconds": 10, "Next": "InitBaselineBuildPollCount" },
+            "WaitForBaselineCommandRegistration": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "InitBaselineBuildPollCount"
+            },
             "InitBaselineBuildPollCount": {
               "Type": "Pass",
               "Parameters": {
@@ -40,20 +59,67 @@
                 "InstanceId": "${BuilderInstanceId}"
               },
               "ResultPath": "$.buildStatus",
+              "TimeoutSeconds": 60,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Ssm.TooManyUpdatesException",
+                    "Ssm.ThrottlingException",
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
               "Next": "CheckBaselineBuildStatus"
             },
             "CheckBaselineBuildStatus": {
               "Type": "Choice",
               "Choices": [
-                { "Variable": "$.buildStatus.Status", "StringEquals": "Success", "Next": "BaselineBuildSucceeded" },
-                { "Variable": "$.buildStatus.Status", "StringEquals": "Failed", "Next": "BaselineBuildFailed" },
-                { "Variable": "$.buildStatus.Status", "StringEquals": "Cancelled", "Next": "BaselineBuildFailed" },
-                { "Variable": "$.buildStatus.Status", "StringEquals": "TimedOut", "Next": "BaselineBuildFailed" },
-                { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "BaselineBuildTimeout" }
+                {
+                  "Variable": "$.buildStatus.Status",
+                  "StringEquals": "Success",
+                  "Next": "BaselineBuildSucceeded"
+                },
+                {
+                  "Variable": "$.buildStatus.Status",
+                  "StringEquals": "Failed",
+                  "Next": "BaselineBuildFailed"
+                },
+                {
+                  "Variable": "$.buildStatus.Status",
+                  "StringEquals": "Cancelled",
+                  "Next": "BaselineBuildFailed"
+                },
+                {
+                  "Variable": "$.buildStatus.Status",
+                  "StringEquals": "TimedOut",
+                  "Next": "BaselineBuildFailed"
+                },
+                {
+                  "Variable": "$.buildStatus.Status",
+                  "StringEquals": "Undeliverable",
+                  "Next": "BaselineBuildFailed"
+                },
+                {
+                  "Variable": "$.buildStatus.Status",
+                  "StringEquals": "Terminated",
+                  "Next": "BaselineBuildFailed"
+                },
+                {
+                  "Variable": "$.pollCount",
+                  "NumericGreaterThanEquals": 40,
+                  "Next": "BaselineBuildTimeout"
+                }
               ],
               "Default": "WaitBaselineBuildStatus"
             },
-            "WaitBaselineBuildStatus": { "Type": "Wait", "Seconds": 15, "Next": "IncrementBaselineBuildPollCount" },
+            "WaitBaselineBuildStatus": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "IncrementBaselineBuildPollCount"
+            },
             "IncrementBaselineBuildPollCount": {
               "Type": "Pass",
               "Parameters": {
@@ -73,7 +139,9 @@
               "Error": "BuildTimeout",
               "Cause": "SSM RunCommand for phase=baseline build did not complete within the polling budget"
             },
-            "BaselineBuildSucceeded": { "Type": "Succeed" }
+            "BaselineBuildSucceeded": {
+              "Type": "Succeed"
+            }
           }
         },
         {
@@ -88,44 +156,122 @@
                 "LaunchType": "FARGATE",
                 "NetworkConfiguration": {
                   "AwsvpcConfiguration": {
-                    "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
-                    "SecurityGroups": ["${DbInitSecurityGroupId}"],
+                    "Subnets": [
+                      "${PublicSubnet1}",
+                      "${PublicSubnet2}"
+                    ],
+                    "SecurityGroups": [
+                      "${DbInitSecurityGroupId}"
+                    ],
                     "AssignPublicIp": "ENABLED"
                   }
                 }
               },
+              "TimeoutSeconds": 1800,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "ECS.ThrottlingException",
+                    "ECS.ServerException",
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
               "End": true
             }
           }
         }
       ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "DeployBaselineImage"
     },
-
     "DeployBaselineImage": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${DeployAppFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "baseline"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "InitBaselinePollCount"
     },
-
     "InitBaselinePollCount": {
       "Type": "Pass",
-      "Parameters": { "runId.$": "$.runId", "pollCount": 0 },
+      "Parameters": {
+        "runId.$": "$.runId",
+        "pollCount": 0
+      },
       "Next": "DescribeAppServiceBaseline"
     },
     "DescribeAppServiceBaseline": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
-      "Parameters": { "Cluster": "${ClusterName}", "Services": ["${AppServiceName}"] },
+      "Parameters": {
+        "Cluster": "${ClusterName}",
+        "Services": [
+          "${AppServiceName}"
+        ]
+      },
       "ResultPath": "$.describeResult",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ECS.ThrottlingException",
+            "ECS.ServerException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "CheckBaselineRollout"
     },
     "CheckBaselineRollout": {
@@ -136,14 +282,25 @@
           "StringEquals": "COMPLETED",
           "Next": "RunK6Baseline"
         },
-        { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "SetBaselineRolloutTimeoutError" }
+        {
+          "Variable": "$.pollCount",
+          "NumericGreaterThanEquals": 20,
+          "Next": "SetBaselineRolloutTimeoutError"
+        }
       ],
       "Default": "WaitBaselineRollout"
     },
-    "WaitBaselineRollout": { "Type": "Wait", "Seconds": 15, "Next": "IncrementBaselinePollCount" },
+    "WaitBaselineRollout": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementBaselinePollCount"
+    },
     "IncrementBaselinePollCount": {
       "Type": "Pass",
-      "Parameters": { "runId.$": "$.runId", "pollCount.$": "States.MathAdd($.pollCount, 1)" },
+      "Parameters": {
+        "runId.$": "$.runId",
+        "pollCount.$": "States.MathAdd($.pollCount, 1)"
+      },
       "Next": "DescribeAppServiceBaseline"
     },
     "SetBaselineRolloutTimeoutError": {
@@ -157,7 +314,6 @@
       },
       "Next": "MarkFailed"
     },
-
     "RunK6Baseline": {
       "Type": "Task",
       "Resource": "arn:aws:states:::ecs:runTask.sync",
@@ -167,8 +323,13 @@
         "LaunchType": "FARGATE",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
-            "SecurityGroups": ["${K6SecurityGroupId}"],
+            "Subnets": [
+              "${PublicSubnet1}",
+              "${PublicSubnet2}"
+            ],
+            "SecurityGroups": [
+              "${K6SecurityGroupId}"
+            ],
             "AssignPublicIp": "ENABLED"
           }
         },
@@ -177,28 +338,72 @@
             {
               "Name": "k6",
               "Environment": [
-                { "Name": "RUN_ID", "Value.$": "$.runId" },
-                { "Name": "PHASE", "Value": "baseline" },
-                { "Name": "TARGET_URL", "Value": "${AppTargetUrl}" }
+                {
+                  "Name": "RUN_ID",
+                  "Value.$": "$.runId"
+                },
+                {
+                  "Name": "PHASE",
+                  "Value": "baseline"
+                },
+                {
+                  "Name": "TARGET_URL",
+                  "Value": "${AppTargetUrl}"
+                }
               ]
             }
           ]
         }
       },
-      "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "ResultPath": "$.k6Baseline",
+      "TimeoutSeconds": 1800,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "CompactBaselineMetrics"
     },
-
     "CompactBaselineMetrics": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${MetricsCompactorFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "baseline",
+          "startTime.$": "$.k6Baseline.Tasks[0].StartedAt",
+          "endTime.$": "$.k6Baseline.Tasks[0].StoppedAt"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "RunAnalyst"
     },
     "RunAnalyst": {
@@ -206,10 +411,35 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${AnalystFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "baseline"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "RunInvestigator"
     },
     "RunInvestigator": {
@@ -217,10 +447,35 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${InvestigatorFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "baseline"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "RunGuard"
     },
     "RunGuard": {
@@ -228,28 +483,79 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${GuardFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "baseline" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "baseline"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "BuildOptimizedImage"
     },
-
     "BuildOptimizedImage": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
-        "InstanceIds": ["${BuilderInstanceId}"],
+        "InstanceIds": [
+          "${BuilderInstanceId}"
+        ],
         "Parameters": {
           "commands.$": "States.Array(States.Format('RUN_ID={} PHASE=optimized /opt/klyro/build.sh', $.runId))"
         }
       },
       "ResultPath": "$.buildCommand",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.TooManyUpdatesException",
+            "Ssm.ThrottlingException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "WaitForOptimizedCommandRegistration"
     },
-    "WaitForOptimizedCommandRegistration": { "Type": "Wait", "Seconds": 10, "Next": "InitOptimizedBuildPollCount" },
+    "WaitForOptimizedCommandRegistration": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "InitOptimizedBuildPollCount"
+    },
     "InitOptimizedBuildPollCount": {
       "Type": "Pass",
       "Parameters": {
@@ -267,21 +573,76 @@
         "InstanceId": "${BuilderInstanceId}"
       },
       "ResultPath": "$.buildStatus",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.TooManyUpdatesException",
+            "Ssm.ThrottlingException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "CheckOptimizedBuildStatus"
     },
     "CheckOptimizedBuildStatus": {
       "Type": "Choice",
       "Choices": [
-        { "Variable": "$.buildStatus.Status", "StringEquals": "Success", "Next": "DeployOptimizedImage" },
-        { "Variable": "$.buildStatus.Status", "StringEquals": "Failed", "Next": "SetOptimizedBuildFailedError" },
-        { "Variable": "$.buildStatus.Status", "StringEquals": "Cancelled", "Next": "SetOptimizedBuildFailedError" },
-        { "Variable": "$.buildStatus.Status", "StringEquals": "TimedOut", "Next": "SetOptimizedBuildFailedError" },
-        { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "SetOptimizedBuildTimeoutError" }
+        {
+          "Variable": "$.buildStatus.Status",
+          "StringEquals": "Success",
+          "Next": "DeployOptimizedImage"
+        },
+        {
+          "Variable": "$.buildStatus.Status",
+          "StringEquals": "Failed",
+          "Next": "SetOptimizedBuildFailedError"
+        },
+        {
+          "Variable": "$.buildStatus.Status",
+          "StringEquals": "Cancelled",
+          "Next": "SetOptimizedBuildFailedError"
+        },
+        {
+          "Variable": "$.buildStatus.Status",
+          "StringEquals": "TimedOut",
+          "Next": "SetOptimizedBuildFailedError"
+        },
+        {
+          "Variable": "$.buildStatus.Status",
+          "StringEquals": "Undeliverable",
+          "Next": "SetOptimizedBuildFailedError"
+        },
+        {
+          "Variable": "$.buildStatus.Status",
+          "StringEquals": "Terminated",
+          "Next": "SetOptimizedBuildFailedError"
+        },
+        {
+          "Variable": "$.pollCount",
+          "NumericGreaterThanEquals": 40,
+          "Next": "SetOptimizedBuildTimeoutError"
+        }
       ],
       "Default": "WaitOptimizedBuildStatus"
     },
-    "WaitOptimizedBuildStatus": { "Type": "Wait", "Seconds": 15, "Next": "IncrementOptimizedBuildPollCount" },
+    "WaitOptimizedBuildStatus": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementOptimizedBuildPollCount"
+    },
     "IncrementOptimizedBuildPollCount": {
       "Type": "Pass",
       "Parameters": {
@@ -313,30 +674,82 @@
       },
       "Next": "MarkFailed"
     },
-
     "DeployOptimizedImage": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${DeployAppFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "optimized" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "optimized"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "InitOptimizedPollCount"
     },
-
     "InitOptimizedPollCount": {
       "Type": "Pass",
-      "Parameters": { "runId.$": "$.runId", "pollCount": 0 },
+      "Parameters": {
+        "runId.$": "$.runId",
+        "pollCount": 0
+      },
       "Next": "DescribeAppServiceOptimized"
     },
     "DescribeAppServiceOptimized": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
-      "Parameters": { "Cluster": "${ClusterName}", "Services": ["${AppServiceName}"] },
+      "Parameters": {
+        "Cluster": "${ClusterName}",
+        "Services": [
+          "${AppServiceName}"
+        ]
+      },
       "ResultPath": "$.describeResult",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ECS.ThrottlingException",
+            "ECS.ServerException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "CheckOptimizedRollout"
     },
     "CheckOptimizedRollout": {
@@ -347,14 +760,25 @@
           "StringEquals": "COMPLETED",
           "Next": "SeedDatabaseOptimized"
         },
-        { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "SetOptimizedRolloutTimeoutError" }
+        {
+          "Variable": "$.pollCount",
+          "NumericGreaterThanEquals": 20,
+          "Next": "SetOptimizedRolloutTimeoutError"
+        }
       ],
       "Default": "WaitOptimizedRollout"
     },
-    "WaitOptimizedRollout": { "Type": "Wait", "Seconds": 15, "Next": "IncrementOptimizedPollCount" },
+    "WaitOptimizedRollout": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementOptimizedPollCount"
+    },
     "IncrementOptimizedPollCount": {
       "Type": "Pass",
-      "Parameters": { "runId.$": "$.runId", "pollCount.$": "States.MathAdd($.pollCount, 1)" },
+      "Parameters": {
+        "runId.$": "$.runId",
+        "pollCount.$": "States.MathAdd($.pollCount, 1)"
+      },
       "Next": "DescribeAppServiceOptimized"
     },
     "SetOptimizedRolloutTimeoutError": {
@@ -368,7 +792,6 @@
       },
       "Next": "MarkFailed"
     },
-
     "SeedDatabaseOptimized": {
       "Type": "Task",
       "Resource": "arn:aws:states:::ecs:runTask.sync",
@@ -378,14 +801,40 @@
         "LaunchType": "FARGATE",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
-            "SecurityGroups": ["${DbInitSecurityGroupId}"],
+            "Subnets": [
+              "${PublicSubnet1}",
+              "${PublicSubnet2}"
+            ],
+            "SecurityGroups": [
+              "${DbInitSecurityGroupId}"
+            ],
             "AssignPublicIp": "ENABLED"
           }
         }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 1800,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ECS.ThrottlingException",
+            "ECS.ServerException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "RunK6Optimized"
     },
     "RunK6Optimized": {
@@ -397,8 +846,13 @@
         "LaunchType": "FARGATE",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["${PublicSubnet1}", "${PublicSubnet2}"],
-            "SecurityGroups": ["${K6SecurityGroupId}"],
+            "Subnets": [
+              "${PublicSubnet1}",
+              "${PublicSubnet2}"
+            ],
+            "SecurityGroups": [
+              "${K6SecurityGroupId}"
+            ],
             "AssignPublicIp": "ENABLED"
           }
         },
@@ -407,28 +861,72 @@
             {
               "Name": "k6",
               "Environment": [
-                { "Name": "RUN_ID", "Value.$": "$.runId" },
-                { "Name": "PHASE", "Value": "optimized" },
-                { "Name": "TARGET_URL", "Value": "${AppTargetUrl}" }
+                {
+                  "Name": "RUN_ID",
+                  "Value.$": "$.runId"
+                },
+                {
+                  "Name": "PHASE",
+                  "Value": "optimized"
+                },
+                {
+                  "Name": "TARGET_URL",
+                  "Value": "${AppTargetUrl}"
+                }
               ]
             }
           ]
         }
       },
-      "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "ResultPath": "$.k6Optimized",
+      "TimeoutSeconds": 1800,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "CompactOptimizedMetrics"
     },
-
     "CompactOptimizedMetrics": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${MetricsCompactorFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "phase": "optimized" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "phase": "optimized",
+          "startTime.$": "$.k6Optimized.Tasks[0].StartedAt",
+          "endTime.$": "$.k6Optimized.Tasks[0].StoppedAt"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "RunEvaluator"
     },
     "RunEvaluator": {
@@ -436,10 +934,34 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${EvaluatorFunctionArn}",
-        "Payload": { "runId.$": "$.runId" }
+        "Payload": {
+          "runId.$": "$.runId"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "RunReportWriter"
     },
     "RunReportWriter": {
@@ -447,22 +969,73 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${ReportWriterFunctionArn}",
-        "Payload": { "runId.$": "$.runId" }
+        "Payload": {
+          "runId.$": "$.runId"
+        }
       },
       "ResultPath": null,
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
       "Next": "ExperimentSucceeded"
     },
-    "ExperimentSucceeded": { "Type": "Succeed" },
-
+    "ExperimentSucceeded": {
+      "Type": "Succeed"
+    },
     "MarkFailed": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${ReportWriterFunctionArn}",
-        "Payload": { "runId.$": "$.runId", "error.$": "$.error" }
+        "Payload": {
+          "runId.$": "$.runId",
+          "error.$": "$.error"
+        }
       },
       "ResultPath": null,
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "ExperimentFailed"
+        }
+      ],
       "Next": "ExperimentFailed"
     },
     "ExperimentFailed": {
@@ -470,5 +1043,6 @@
       "Error": "ExperimentFailed",
       "Cause": "Klyro experiment pipeline failed - see runs/<runId>/report.json for the recorded reason"
     }
-  }
+  },
+  "TimeoutSeconds": 5400
 }
