@@ -10,10 +10,25 @@ fix, and produces a deterministic before/after verdict.
 ## Stack
 - Infra: AWS CDK, TypeScript, one app under infra/
 - Compute: ECS on Fargate (app service, db service, k6 task, db-init task)
-- Build: CodeBuild (privileged mode + local Docker layer cache)
+- Build: a persistent EC2 instance (Amazon Linux 2023 + Docker), driven by
+  SSM RunCommand (`AWS-RunShellScript`), running the same build/patch/push
+  logic a CodeBuild buildspec would. Originally speced as CodeBuild
+  (privileged mode + local Docker layer cache); switched because this
+  AWS account's CodeBuild concurrent-build quota is 0 in every region and
+  AWS Support denied the increase request outright, recommending "at
+  least one billing cycle" of general account usage first — not a wait
+  the project had time for. EC2's on-demand vCPU quota was already
+  non-zero, so an always-on builder instance reached by SendCommand
+  sidesteps CodeBuild's abuse-prevention gate entirely while keeping the
+  same source-zip-plus-in-place-patch build model.
 - Orchestration: Step Functions, using `.sync` service integrations for
-  ECS RunTask and CodeBuild StartBuild wherever possible — do not write
-  custom Lambda polling loops for build/task completion.
+  ECS RunTask wherever possible — do not write custom Lambda polling
+  loops for task completion. SSM RunCommand has no `.sync` integration
+  pattern, so the build step's completion is polled via a bounded
+  Wait/Choice loop (`ssm:sendCommand` then `ssm:getCommandInvocation`),
+  the same hand-built pattern already used for ECS service rollout
+  stabilization — this is the one deliberate exception to "no custom
+  polling loops," made because no `.sync` alternative exists for SSM.
 - LLM: Mistral API (OpenAI-compatible), models read from env vars
   LLM_MODEL_ANALYST and LLM_MODEL_INVESTIGATOR, defaulting to
   mistral-small-latest and mistral-large-latest. Access via a small

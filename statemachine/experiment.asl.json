@@ -11,16 +11,69 @@
           "States": {
             "BuildBaselineImage": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
               "Parameters": {
-                "ProjectName": "${AppBuildProjectName}",
-                "EnvironmentVariablesOverride": [
-                  { "Name": "RUN_ID", "Value.$": "$.runId", "Type": "PLAINTEXT" },
-                  { "Name": "PHASE", "Value": "baseline", "Type": "PLAINTEXT" }
-                ]
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds": ["${BuilderInstanceId}"],
+                "Parameters": {
+                  "commands.$": "States.Array(States.Format('RUN_ID={} PHASE=baseline /opt/klyro/build.sh', $.runId))"
+                }
               },
-              "End": true
-            }
+              "ResultPath": "$.buildCommand",
+              "Next": "WaitForBaselineCommandRegistration"
+            },
+            "WaitForBaselineCommandRegistration": { "Type": "Wait", "Seconds": 10, "Next": "InitBaselineBuildPollCount" },
+            "InitBaselineBuildPollCount": {
+              "Type": "Pass",
+              "Parameters": {
+                "runId.$": "$.runId",
+                "commandId.$": "$.buildCommand.Command.CommandId",
+                "pollCount": 0
+              },
+              "Next": "GetBaselineBuildStatus"
+            },
+            "GetBaselineBuildStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.commandId",
+                "InstanceId": "${BuilderInstanceId}"
+              },
+              "ResultPath": "$.buildStatus",
+              "Next": "CheckBaselineBuildStatus"
+            },
+            "CheckBaselineBuildStatus": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.buildStatus.Status", "StringEquals": "Success", "Next": "BaselineBuildSucceeded" },
+                { "Variable": "$.buildStatus.Status", "StringEquals": "Failed", "Next": "BaselineBuildFailed" },
+                { "Variable": "$.buildStatus.Status", "StringEquals": "Cancelled", "Next": "BaselineBuildFailed" },
+                { "Variable": "$.buildStatus.Status", "StringEquals": "TimedOut", "Next": "BaselineBuildFailed" },
+                { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "BaselineBuildTimeout" }
+              ],
+              "Default": "WaitBaselineBuildStatus"
+            },
+            "WaitBaselineBuildStatus": { "Type": "Wait", "Seconds": 15, "Next": "IncrementBaselineBuildPollCount" },
+            "IncrementBaselineBuildPollCount": {
+              "Type": "Pass",
+              "Parameters": {
+                "runId.$": "$.runId",
+                "commandId.$": "$.commandId",
+                "pollCount.$": "States.MathAdd($.pollCount, 1)"
+              },
+              "Next": "GetBaselineBuildStatus"
+            },
+            "BaselineBuildFailed": {
+              "Type": "Fail",
+              "Error": "BuildFailed",
+              "Cause": "SSM RunCommand for phase=baseline build did not succeed - check the AWS-RunShellScript command output on the klyro-builder instance"
+            },
+            "BaselineBuildTimeout": {
+              "Type": "Fail",
+              "Error": "BuildTimeout",
+              "Cause": "SSM RunCommand for phase=baseline build did not complete within the polling budget"
+            },
+            "BaselineBuildSucceeded": { "Type": "Succeed" }
           }
         },
         {
@@ -184,18 +237,83 @@
 
     "BuildOptimizedImage": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
-        "ProjectName": "${AppBuildProjectName}",
-        "EnvironmentVariablesOverride": [
-          { "Name": "RUN_ID", "Value.$": "$.runId", "Type": "PLAINTEXT" },
-          { "Name": "PHASE", "Value": "optimized", "Type": "PLAINTEXT" }
-        ]
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": ["${BuilderInstanceId}"],
+        "Parameters": {
+          "commands.$": "States.Array(States.Format('RUN_ID={} PHASE=optimized /opt/klyro/build.sh', $.runId))"
+        }
       },
-      "ResultPath": null,
+      "ResultPath": "$.buildCommand",
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
-      "Next": "DeployOptimizedImage"
+      "Next": "WaitForOptimizedCommandRegistration"
     },
+    "WaitForOptimizedCommandRegistration": { "Type": "Wait", "Seconds": 10, "Next": "InitOptimizedBuildPollCount" },
+    "InitOptimizedBuildPollCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "commandId.$": "$.buildCommand.Command.CommandId",
+        "pollCount": 0
+      },
+      "Next": "GetOptimizedBuildStatus"
+    },
+    "GetOptimizedBuildStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.commandId",
+        "InstanceId": "${BuilderInstanceId}"
+      },
+      "ResultPath": "$.buildStatus",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "CheckOptimizedBuildStatus"
+    },
+    "CheckOptimizedBuildStatus": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.buildStatus.Status", "StringEquals": "Success", "Next": "DeployOptimizedImage" },
+        { "Variable": "$.buildStatus.Status", "StringEquals": "Failed", "Next": "SetOptimizedBuildFailedError" },
+        { "Variable": "$.buildStatus.Status", "StringEquals": "Cancelled", "Next": "SetOptimizedBuildFailedError" },
+        { "Variable": "$.buildStatus.Status", "StringEquals": "TimedOut", "Next": "SetOptimizedBuildFailedError" },
+        { "Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "SetOptimizedBuildTimeoutError" }
+      ],
+      "Default": "WaitOptimizedBuildStatus"
+    },
+    "WaitOptimizedBuildStatus": { "Type": "Wait", "Seconds": 15, "Next": "IncrementOptimizedBuildPollCount" },
+    "IncrementOptimizedBuildPollCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "commandId.$": "$.commandId",
+        "pollCount.$": "States.MathAdd($.pollCount, 1)"
+      },
+      "Next": "GetOptimizedBuildStatus"
+    },
+    "SetOptimizedBuildFailedError": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "error": {
+          "Error": "BuildFailed",
+          "Cause": "SSM RunCommand for phase=optimized build did not succeed - check the AWS-RunShellScript command output on the klyro-builder instance"
+        }
+      },
+      "Next": "MarkFailed"
+    },
+    "SetOptimizedBuildTimeoutError": {
+      "Type": "Pass",
+      "Parameters": {
+        "runId.$": "$.runId",
+        "error": {
+          "Error": "BuildTimeout",
+          "Cause": "SSM RunCommand for phase=optimized build did not complete within the polling budget"
+        }
+      },
+      "Next": "MarkFailed"
+    },
+
     "DeployOptimizedImage": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",

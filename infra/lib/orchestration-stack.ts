@@ -1,7 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
-import * as codebuild from 'aws-cdk-lib/aws-codebuild';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
@@ -23,7 +22,8 @@ export interface OrchestrationStackProps extends cdk.StackProps {
   dbInitSecurityGroup: ec2.ISecurityGroup;
   k6TaskDefinition: ecs.FargateTaskDefinition;
   k6SecurityGroup: ec2.ISecurityGroup;
-  appBuildProject: codebuild.IProject;
+  /** The EC2 instance ID of the SSM-driven app-image builder (replaces CodeBuild — see CLAUDE.md). */
+  builderInstanceId: string;
 }
 
 // Mistral, not Groq — CLAUDE.md originally specified Groq, but the user
@@ -66,7 +66,7 @@ export class OrchestrationStack extends cdk.Stack {
       dbInitSecurityGroup,
       k6TaskDefinition,
       k6SecurityGroup,
-      appBuildProject,
+      builderInstanceId,
     } = props;
     const repoRoot = path.join(__dirname, '..', '..');
     const lambdasRoot = path.join(repoRoot, 'lambdas');
@@ -302,27 +302,29 @@ export class OrchestrationStack extends cdk.Stack {
       );
     }
 
-    // CodeBuild StartBuild.sync — the extra events:* grant is the documented
-    // requirement for Step Functions' .sync integrations: they subscribe to
-    // a managed EventBridge rule to know when the build finishes.
+    // Build step: ssm:SendCommand against the one builder instance, running
+    // the fixed AWS-RunShellScript document — see CLAUDE.md for why this
+    // replaced CodeBuild StartBuild.sync. SendCommand needs permission on
+    // both the target instance and the document; GetCommandInvocation (used
+    // by the hand-built poll loop, since SSM has no .sync integration) has
+    // no resource-level permissions in SSM's IAM action reference — an
+    // AWS-required "*" exception, same category as ecs:DescribeServices below.
+    const builderInstanceArn = `arn:aws:ec2:${this.region}:${this.account}:instance/${builderInstanceId}`;
+    const runShellScriptDocArn = `arn:aws:ssm:${this.region}::document/AWS-RunShellScript`;
     addStateMachinePolicy(
       new iam.PolicyStatement({
-        actions: ['codebuild:StartBuild', 'codebuild:StopBuild', 'codebuild:BatchGetBuilds'],
-        resources: [appBuildProject.projectArn],
+        actions: ['ssm:SendCommand'],
+        resources: [builderInstanceArn, runShellScriptDocArn],
       })
     );
     addStateMachinePolicy(
-      new iam.PolicyStatement({
-        actions: ['events:PutTargets', 'events:PutRule', 'events:DescribeRule'],
-        resources: [
-          `arn:aws:events:${this.region}:${this.account}:rule/StepFunctionsGetEventForCodeBuildStartBuildRule`,
-        ],
-      })
+      new iam.PolicyStatement({ actions: ['ssm:GetCommandInvocation'], resources: ['*'] })
     );
 
-    // ECS RunTask.sync for both db-init and k6 — same documented .sync
-    // EventBridge requirement as CodeBuild above, plus PassRole for
-    // whichever task/execution roles those two task definitions use.
+    // ECS RunTask.sync for both db-init and k6 — needs the documented
+    // EventBridge managed-rule permissions .sync integrations require,
+    // plus PassRole for whichever task/execution roles those two task
+    // definitions use.
     const dbInitTaskDefArnPattern = `arn:aws:ecs:${this.region}:${this.account}:task-definition/${dbInitTaskDefinition.family}:*`;
     const k6TaskDefArnPattern = `arn:aws:ecs:${this.region}:${this.account}:task-definition/${k6TaskDefinition.family}:*`;
     addStateMachinePolicy(
@@ -378,7 +380,7 @@ export class OrchestrationStack extends cdk.Stack {
       'utf8'
     );
     const substitutions: Record<string, string> = {
-      AppBuildProjectName: appBuildProject.projectName,
+      BuilderInstanceId: builderInstanceId,
       ClusterName: cluster.clusterName,
       AppServiceName: appService.serviceName,
       DbInitTaskFamily: dbInitTaskDefinition.family,
